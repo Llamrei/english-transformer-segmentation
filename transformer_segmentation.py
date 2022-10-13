@@ -3,6 +3,7 @@
 
 from datetime import datetime
 import logging
+import logging.handlers as handlers
 import time
 import sys
 import string
@@ -20,7 +21,21 @@ import tensorflow_datasets as tfds
 # Also could improve through use of gather to make the where code more streamlined
 # Also can improve speed of metrics through converting into tf.function - but need to remove python mutable objects
 # Can also probably speed up metrics through use of tensorarrays instead of ragged tensors.
-# Proper logging, hyper param opt and experiment tracking
+# Proper Hyper param opt and experiment tracking
+TODAY = datetime.today().strftime('%Y-%m-%d %H-%M')
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+stderr = logging.StreamHandler()
+stderr.setLevel(logging.INFO)
+stderr.setFormatter(formatter)
+file_output = handlers.RotatingFileHandler(f'{TODAY}.log', maxBytes=10000, backupCount=1)
+file_output.setLevel(logging.DEBUG)
+file_output.setFormatter(formatter)
+logger.addHandler(stderr)
+logger.addHandler(file_output)
+
+logger.debug(f"Eager: {tf.executing_eagerly()}")
 
 # Running params
 GPU_FROM = int(sys.argv[1])
@@ -31,7 +46,7 @@ JOINING_PUNC = r"([-'`])"
 SPLITTING_PUNC = r'([!"#$%&()\*\+,\./:;<=>?@\[\\\]^_{|}~])'
 NGRAM = 4
 MAX_CHARS = 1000
-BATCH_SIZE = 64
+BATCH_SIZE = 16
 
 # Metric params
 CLASS_THRESHOLD = 0.5
@@ -45,17 +60,10 @@ DROPOUT_RATE = 0.3
 EPOCHS = 1
 
 visible_devices = tf.config.get_visible_devices('GPU')
-print("Num GPUs:", len(visible_devices))
+logger.info(f"Num GPUs visible:{len(visible_devices)}")
 tf.config.set_visible_devices(visible_devices[GPU_FROM:GPU_TO],'GPU')
 visible_devices = tf.config.get_visible_devices('GPU')
-print("Num GPUs:", len(visible_devices))
-
-TODAY = datetime.today().strftime('%Y-%m-%d %H-%M')
-
-def log(txt):
-    with open(f"transformer_{TODAY}.log", "a") as f:
-        f.write(txt+'\n')
-    print(txt, end = "")
+logger.info(f"Num GPUs to be used: {len(visible_devices)}")
 
 
 # # Data preprocessing
@@ -122,7 +130,7 @@ def tokenizer_vocab_size(num_punc):
 encoder_tokenizer = tf.keras.layers.TextVectorization(
     standardize="lower", 
     split="character", 
-    ngrams=NGRAM,
+    ngrams=(NGRAM,),
     max_tokens=tokenizer_vocab_size(3), # Want to be able to handle at least #, . and '
     output_sequence_length=MAX_CHARS-1, # Drop one as we need to account for the fact we predict if a space _follows_
     output_mode="int"
@@ -130,7 +138,7 @@ encoder_tokenizer = tf.keras.layers.TextVectorization(
 decoder_tokenizer = tf.keras.layers.TextVectorization(
     standardize="lower", 
     split="character", 
-    ngrams=NGRAM,
+    ngrams=(NGRAM,),
     max_tokens=tokenizer_vocab_size(4), # As above but also with a space
     output_sequence_length=MAX_CHARS-1,
     output_mode="int"
@@ -767,7 +775,7 @@ train_sentence_accuracy = tf.keras.metrics.Mean(name='train_token_accuracy')
 train_AUC = tf.keras.metrics.AUC(name="train_AUC", from_logits=False)
 train_Voting_Experts = VotingExpertsMetric()
 
-checkpoint_path = f"./checkpoints/{TODAY}"
+checkpoint_path = f"./checkpoints/"
 
 ckpt = tf.train.Checkpoint(transformer=transformer,
                            optimizer=optimizer)
@@ -777,7 +785,7 @@ ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
 # If a checkpoint exists, restore the latest checkpoint.
 if ckpt_manager.latest_checkpoint:
     ckpt.restore(ckpt_manager.latest_checkpoint)
-    print('Latest checkpoint restored!!')
+    logger.info('Latest checkpoint restored!!')
 
 
 # ## Training step
@@ -842,23 +850,22 @@ for epoch in range(EPOCHS):
                     train_Voting_Experts.update_state(tar, preds)
                     error_types = {k: f"{v:.2f}" for k, v in train_Voting_Experts.result().items()}
                     after_ve = time.time()
-                    log(f"Voting_experts ({after_ve - after_auc:.2f}s to generate): {error_types}")
-            log((f"\nEpoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} ({train_loss_low.result():.4f}-{train_loss_med.result():.4f}-{train_loss_high.result():.4f})"
+                    logger.info(f"Voting_experts ({after_ve - after_auc:.2f}s to generate): {error_types}")
+            logger.info((f"\nEpoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} ({train_loss_low.result():.4f}-{train_loss_med.result():.4f}-{train_loss_high.result():.4f})"
                 f" | Token Accuracy {train_token_accuracy.result():.4f} Sentence accuracy {train_sentence_accuracy.result()}"))
-            log(f" AUC {train_AUC.result():.4f}")
-            log(f"\nTime taken for 1 batch: {end - batch_start:.2f}, extra {after_auc - end:.2f} spent on AUC")
+            logger.info(f" AUC {train_AUC.result():.4f}")
+            logger.info(f"\nTime taken for 1 batch: {end - batch_start:.2f}, extra {after_auc - end:.2f} spent on AUC")
             
         if (epoch - 1) % 5 == 0:
             ckpt_save_path = ckpt_manager.save()
-            log(f'\nSaved checkpoint for epoch {epoch+1} at {ckpt_save_path}')
-        print(".", end="")
+            logger.info(f'\nSaved checkpoint for epoch {epoch+1} at {ckpt_save_path}')
+        logger.debug(".")
     
     train_Voting_Experts.update_state(tar, preds)
     error_types = {k: f"{v:.2f}" for k, v in train_Voting_Experts.result().items()}
-    log(f"Voting_experts: {error_types}")
-    log((f"\nEpoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} ({train_loss_low.result():.4f}-{train_loss_med.result():.4f}-{train_loss_high.result():.4f})"
+    logger.info(f"Voting_experts: {error_types}")
+    logger.info((f"\nEpoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} ({train_loss_low.result():.4f}-{train_loss_med.result():.4f}-{train_loss_high.result():.4f})"
                 f" | Token Accuracy {train_token_accuracy.result():.4f} Sentence accuracy {train_sentence_accuracy.result()}"))
-    log(f'\nTime taken for 1 epoch: {time.time() - start:.2f} secs\n')
-    log(f'')
+    logger.info(f'\nTime taken for 1 epoch: {time.time() - start:.2f} secs\n')
 
 ckpt_manager.save()
