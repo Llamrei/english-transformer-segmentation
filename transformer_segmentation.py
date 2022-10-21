@@ -52,15 +52,18 @@ file_output.setLevel(logging.DEBUG)
 file_output.setFormatter(formatter)
 logger.addHandler(file_output)
 
+DEBUG = True
+NEGATIVE_CONTROL = True
+
 logger.info(f"Eager: {tf.executing_eagerly()}")
 
 # Running params
 if __name__ == "__main__":
-    RUN = True
+    RUN_AS_SCRIPT = True
     GPU_FROM = int(sys.argv[1])
     GPU_TO = int(sys.argv[2])
 else:
-    RUN = False
+    RUN_AS_SCRIPT = False
     GPU_FROM = 0
     GPU_TO = 0
 
@@ -68,8 +71,8 @@ else:
 JOINING_PUNC = r"([-'`])"
 SPLITTING_PUNC = r'([!"#$%&()\*\+,\./:;<=>?@\[\\\]^_{|}~])'
 NGRAM = 4
-MAX_CHARS = 1000
-BATCH_SIZE = 16
+MAX_CHARS = 1000 if not DEBUG else 10
+BATCH_SIZE = 16 if not DEBUG else 2
 
 # Metric params
 CLASS_THRESHOLD = 0.5
@@ -83,9 +86,6 @@ DROPOUT_RATE = 0.3
 
 # Training params
 EPOCHS = 1
-
-DEBUG = True
-NEGATIVE_CONTROL = True
 
 visible_devices = tf.config.get_visible_devices('GPU')
 logger.info(f"Num GPUs visible:{len(visible_devices)}")
@@ -166,6 +166,7 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
 train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 test_ds = test.batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 
+# tf.print("Average usage of MAX_CHARS", avg/tf.cast(i, avg.dtype))
 if DEBUG:
     def label_stats(inputs, labels):
         mask = tf.cast(labels != 0, tf.float32)
@@ -224,7 +225,7 @@ def get_with_spaces(inputs, labels):
     return inputs[1]
 
 
-if RUN:
+if RUN_AS_SCRIPT:
     inputs = train_ds.map(get_without_spaces)
     outputs = train_ds.map(get_with_spaces)
     encoder_tokenizer.adapt(inputs)
@@ -944,7 +945,7 @@ callbacks=[model_checkpoint_callback,]
 if DEBUG:
     callbacks.append(tboard_callback)
 
-if RUN:
+if RUN_AS_SCRIPT:
     logger.info("Compiling model")
     transformer.compile(optimizer=optimizer, run_eagerly=True)
     logger.info("Fitting model")
