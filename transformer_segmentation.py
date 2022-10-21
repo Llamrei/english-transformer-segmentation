@@ -1,9 +1,21 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+# Next step: Convert the model to be subclass of Model
+# 1) Rewrite train step, using custom metrics and returning in a dict, thus not needing to use custom Metrics
+# 2) Rewrite loss as tensorflow Loss function
+# 3) Rewrite metrics that occur only on X iterations: inspired by https://stackoverflow.com/questions/56826495/how-to-make-keras-compute-a-certain-metric-on-validation-data-only
+# 4) Write test time/call logic
+# 5) Do we need to return attention weights?
+# Then: Run with Tensorboard profiler plugin
+# Also: think about how to create dataset for Kevin's version
+# Also: rewrite a token accuracy metric that corresponds to BIES tagging protocol
+# Think why NoTwoSpaces is so slow
+
 from datetime import datetime
 import logging
 import logging.handlers as handlers
+import pathlib
 import time
 import sys
 import string
@@ -22,7 +34,13 @@ import tensorflow_datasets as tfds
 # Also can improve speed of metrics through converting into tf.function - but need to remove python mutable objects
 # Can also probably speed up metrics through use of tensorarrays instead of ragged tensors.
 # Proper Hyper param opt and experiment tracking
+# More precisely accurate loss using backend.binary_crossentropy
+
 TODAY = datetime.today().strftime('%Y-%m-%d %H-%M')
+TENSORBOARD_DIR = './tensorboard/'
+CHECKPOINT_DIR = './checkpoint/'
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -32,7 +50,6 @@ stderr.setFormatter(formatter)
 file_output = handlers.RotatingFileHandler(f'{TODAY}.log', maxBytes=10000, backupCount=1)
 file_output.setLevel(logging.DEBUG)
 file_output.setFormatter(formatter)
-logger.addHandler(stderr)
 logger.addHandler(file_output)
 
 logger.debug(f"Eager: {tf.executing_eagerly()}")
@@ -57,13 +74,24 @@ D_MODEL = 256
 DFF = 1028
 NUM_ATTENTION_HEADS = 2
 DROPOUT_RATE = 0.3
+
+# Training params
 EPOCHS = 1
+MAX_BATCHES = False
+
+
+DEBUG=True
+if DEBUG:
+    # tf.debugging.set_log_device_placement(True)
+    MAX_BATCHES = 23
 
 visible_devices = tf.config.get_visible_devices('GPU')
-logger.info(f"Num GPUs visible:{len(visible_devices)}")
+logger.debug(f"Num GPUs visible:{len(visible_devices)}")
 tf.config.set_visible_devices(visible_devices[GPU_FROM:GPU_TO],'GPU')
+# tf.config.set_visible_devices([],'GPU')
+
 visible_devices = tf.config.get_visible_devices('GPU')
-logger.info(f"Num GPUs to be used: {len(visible_devices)}")
+logger.debug(f"Num GPUs to be used: {len(visible_devices)}")
 
 
 # # Data preprocessing
@@ -73,8 +101,10 @@ logger.info(f"Num GPUs to be used: {len(visible_devices)}")
 # How to handle punctuation and numbers?
 
 # For real deal probably want the 'lm1b' dataset
+logger.debug("Loading data")
 train, test = tfds.load('ag_news_subset', split="train"), tfds.load('ag_news_subset', split="test")
 
+logger.debug("Preprocessing data")
 punc_mapping = {ord(x):x for x in string.punctuation}
 entity_mapping = {f" ?{k}": v for k, v in html.entities.html5.items() if k.endswith(";") and v in string.punctuation}
 punc_mapping = {f' ?&?#?{k};': v for k, v in punc_mapping.items()}
@@ -98,7 +128,7 @@ def strip_spaces_and_set_predictions(text):
     x = tf.strings.regex_replace(x, SPLITTING_PUNC, r"\1 ")   # \1 inserts captured splitting punctuation, raw so python doesnt magic it
     x = tf.strings.split(x)
     no_whitespace_list = tf.strings.strip(x) # Remove any excess whitespace, e.g. tabs, double spaces etc.
-    x = tf.strings.reduce_join(no_whitespace_list, axis=-1)
+    x = tf.strings.reduce_join(no_whitespace_list, separator="", axis=-1)
     y = tf.strings.reduce_join(no_whitespace_list, separator=" ", axis=-1)
     
     padding = tf.broadcast_to("#"*(NGRAM-1), (tf.shape(x)[0],) )
@@ -111,20 +141,33 @@ def strip_spaces_and_set_predictions(text):
     
     chars = tf.strings.unicode_split(y, "UTF-8")
     char_ngrams = tf.strings.ngrams(chars, ngram_width=NGRAM, separator="")
-    labels = tf.strings.regex_full_match(char_ngrams, ".. ")
+    labels = tf.strings.regex_full_match(char_ngrams, ".* ")
     labels = tf.cast(labels, 'int64')+1 # Add 1 to be able to tell difference between padding and prediction
     labels = labels.to_tensor(default_value=0, shape=[None, MAX_CHARS])
     # Roll so we predict for _future_ spaces not spaces in current token (if we knew space in current token we wouldnt have anything to solve)
     labels = tf.roll(labels, shift=-1, axis=-1)
     labels = labels[:,:-1]
+
+    # Negative controls
+    # Permute
+    # labels = tf.random.experimental.stateless_shuffle(labels, seed=[1507, 1997]) # shuffles batch
+
+    # Truly random
+    # present = labels != 0
+    # labels = tf.random.stateless_binomial(shape=tf.shape(labels), seed=[1507, 1997], counts=1, probs=0.5) + 1
+    # labels = tf.cast(present, labels.dtype)*labels
+    # labels = tf.cast(labels, tf.int64)
     return (x, y), labels
 
 train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 test_ds = test.batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 
+logger.debug("Training tokenizers")
 # # Defining tokenizers
 # Want to be able to encode every n-gram of lowercase letters and however many prescribed punctuation characters
 def tokenizer_vocab_size(num_punc):
+    if DEBUG:
+        return 100
     return (len(string.ascii_lowercase)+num_punc)**NGRAM
     
 encoder_tokenizer = tf.keras.layers.TextVectorization(
@@ -153,6 +196,236 @@ outputs = train_ds.map(get_with_spaces)
 encoder_tokenizer.adapt(inputs)
 decoder_tokenizer.adapt(outputs)
 
+# # Metrics and losses
+loss_object = tf.keras.losses.BinaryCrossentropy(
+    from_logits=False,
+    reduction=tf.keras.losses.Reduction.NONE # Need no reduction so we can mask out irrelevant predictions
+)
+
+def get_real(real_raw):
+    """
+    Converts a batch of {0,1,2} into a batch of {0,1} by mapping 1 to 0 and 2 to 1.
+
+    Also returns a batched boolean mask corresponding to locations of original 1s and 2s.
+    """
+    # Function to convert the 0 mask and 1/2 category tokens into a mask 
+    # and 0/1 tokens (suitable for binary cross-entropy)
+    # Mask will have bool dtype
+    mask = tf.math.logical_not(tf.math.equal(real_raw, 0))
+    real = real_raw - tf.cast(mask, real_raw.dtype)
+    return real, mask
+
+def used_all_characters_mask(real_raw, pred):
+    """
+    Takes a label batch of {0,1,2} indicating not present, letter, space 
+    and a prediction batch of [0,1] indicating letter and space.
+
+    Returns batch mask of pred that represents using all the letters in the label.
+    """
+    real, _ = get_real(real_raw) # batch, max_chars
+    real_letters = 1 - real
+    real_letter_count = tf.math.cumsum(real_letters, axis=-1)
+    letters_in_phrase = real_letter_count[..., -1] # batch, 1
+    
+    if tf.shape(pred)[-1] == 1:
+        pred = tf.squeeze(pred, axis=-1) # pred now batch, max_chars
+    boundaries = tf.cast(pred > CLASS_THRESHOLD, real.dtype) # batch, max_chars
+    pred_letters = 1 - boundaries
+    pred_letter_count = tf.math.cumsum(pred_letters, axis=-1) # batch, max_chars
+    return pred_letter_count <= letters_in_phrase[..., tf.newaxis] # batch max_chars
+
+def loss_function(real, pred, mask):
+    """
+    Takes a batch of {0,1} labels (e.g. need to preprocess labels), [0,1] predictions and a boolean mask for computing loss.
+
+    Also returns a distribution of the loss across the batch.
+    """
+    if tf.shape(pred)[-1] == 1:
+        pred = tf.squeeze(pred, axis=-1)
+    pred *= tf.cast(mask, dtype=pred.dtype)
+    loss_object.reduction = tf.losses.Reduction.NONE # Make loss not reduce so we can sample dist of loss
+    loss_ = loss_object(real, pred)
+    # Dont divide by tf.cast(tf.reduce_sum(mask), dtype=loss_.dtype) 
+    # as we hope that the masked (0 + eps) output matching the real 0 is good enough to not fit to masked data
+    return tf.reduce_mean(loss_), loss_
+
+def token_accuracy(real_raw, pred):
+    """
+    Takes a batch of labels {0,1,2} and batch of predictions [0,1] and returns per token accuracy.
+
+    We can mask out either following only tokens that are in label or tokens in prediction
+    that represent usage of all of the letters. We choose whichever is longer.
+    """
+    real, real_mask = get_real(real_raw)
+    predicted_mask = used_all_characters_mask(real_raw, pred)
+    mask = tf.cast(predicted_mask | real_mask, real.dtype)
+    if tf.shape(pred)[-1] == 1:
+        pred = tf.squeeze(pred, axis=-1)
+    pred *= tf.cast(mask, pred.dtype)
+    accuracies = tf.equal(real, tf.cast( pred > CLASS_THRESHOLD, real.dtype))
+    accuracies = tf.cast(accuracies, dtype=mask.dtype)
+    accuracies *= mask
+    return tf.reduce_mean(tf.reduce_sum(accuracies, axis=-1)/tf.reduce_sum(mask, axis=-1))
+
+def sentence_accuracy(real_raw, pred):
+    """
+    Takes a batch of labels {0,1,2} and batch of predictions [0,1] and returns whole sentence accuracy across the batch.
+
+    We can mask out either following only tokens that are in label or tokens in prediction
+    that represent usage of all of the letters. We choose whichever is longer.
+    """
+    real, real_mask = get_real(real_raw)
+    predicted_mask = used_all_characters_mask(real_raw, pred)
+    mask = tf.cast(real_mask | predicted_mask, real.dtype)
+    if tf.shape(pred)[-1] == 1:
+        pred = tf.squeeze(pred, axis=-1)
+    accuracies = tf.equal(real, tf.cast(pred > CLASS_THRESHOLD, real.dtype))
+    accuracies = tf.cast(accuracies, dtype=mask.dtype)
+    accuracies *= mask
+    accuracies += 1 - mask # A bit worried about the double accuracy of this but w/e
+    sentence_accuracies = tf.reduce_prod(accuracies, axis=-1)
+    return tf.reduce_mean(sentence_accuracies)
+
+def row_parse_real_word_boundaries(real_row):
+    # Given (seq_length,) we want to return a tensor of shape
+    # (no_words, 2) where first index chooses a word and 2nd index chooses which
+    # numbered letter starts and ends the word
+    real, _ = get_real(real_row)
+    no_words = tf.reduce_sum(real, axis=-1) # We don't need to find the first boundary
+    real = tf.roll(real, shift=1, axis=-1)
+    real_letters = 1 - real
+    real_letter_count = tf.cast(tf.math.cumsum(real_letters), real.dtype)
+    words = []
+    start_index = tf.cast(0, tf.int64)
+    for end_index in tf.where(real):
+        end_index = end_index[0]
+        words.extend([real_letter_count[start_index],real_letter_count[end_index]])
+        start_index = end_index + 1
+    res = tf.RaggedTensor.from_uniform_row_length(words, 2)
+    return res
+
+def row_indices_of_wrapping_boundaries(pred_row, real_word_boundaries):
+    # If real_word_boundaries is (no_words, 2) and pred is (seq_length, 1)
+    # Then this should return (no_words, 3) second index idenitfying
+    # left gap, mid word gap, right gap
+    if tf.shape(pred_row)[-1] == 1:
+        pred_row = tf.squeeze(pred_row, axis=-1)
+    pred_spaces = tf.cast(pred_row > CLASS_THRESHOLD, tf.int64)
+    seq_length = tf.cast(tf.shape(pred_row)[0], dtype=pred_spaces.dtype)
+    pred_indices = tf.range(seq_length, dtype=pred_spaces.dtype)
+    # Mask out last prediction before rolling
+    pred_spaces *= tf.cast(pred_indices < seq_length - 1, dtype=pred_spaces.dtype)
+    pred_spaces = tf.roll(pred_spaces, shift=1, axis=-1)
+    pred_letters = 1 - pred_spaces 
+    pred_letter_count = tf.math.cumsum(pred_letters)
+    pred_letter_count -= pred_spaces*tf.cast(tf.shape(pred_row)[0]*2, pred_spaces.dtype)
+    wrapping_boundaries = []
+    for word_index in tf.range(tf.shape(real_word_boundaries)[0]):
+        word = tf.cast(real_word_boundaries[word_index,...], pred_spaces.dtype)
+        start_count, end_count = tf.unstack(word)
+        word_mask = (pred_letter_count >= start_count) & (pred_letter_count <= end_count)
+        letter_indices = tf.where(word_mask)
+        if tf.shape(letter_indices)[0] >= tf.cast((end_count - start_count)+1, tf.int32):
+            start_index, end_index = letter_indices[0][0], letter_indices[-1][0]
+        else:
+            # Can't find the word in this prediction - means we are definitely fuarked
+            # We pretend it is a total failure by saying the string is the whole string minus two either side so falls
+            # into cat 6 error
+            start_index, end_index = tf.constant(2, dtype=pred_spaces.dtype), tf.cast(tf.shape(pred_spaces)[0]-2, dtype=pred_spaces.dtype)
+        left_mask = tf.cast(pred_indices < start_index, pred_spaces.dtype)
+        right_mask = tf.cast(pred_indices > end_index, pred_spaces.dtype)
+        if tf.shape(tf.where(tf.cast(left_mask & pred_spaces, tf.int64)))[0] > 0:
+            left_boundary = tf.where(tf.cast(left_mask & pred_spaces, tf.int64))[-1][0]
+        else:
+            left_boundary = tf.constant(-1, dtype=pred_spaces.dtype)
+        if tf.shape(tf.where(tf.cast(right_mask & pred_spaces, tf.int64)))[0] > 0:
+            right_boundary = tf.where(tf.cast(right_mask & pred_spaces, tf.int64))[0][0]
+        else:
+            right_boundary = tf.cast(tf.shape(pred_spaces)[0]+1, dtype=pred_spaces.dtype)
+        left_gap = start_index - left_boundary
+        letter_gap = end_index - start_index
+        letter_delta = letter_gap - (end_count - start_count)
+        right_gap = right_boundary - end_index
+        wrapping_boundaries.extend([left_gap, letter_delta, right_gap])
+    return tf.RaggedTensor.from_uniform_row_length(wrapping_boundaries, 3)    
+
+def invalid_gaps(word_info):
+    return (word_info[0] < 1) | (word_info[2] < 1)
+
+def no_error(word_info):
+    return (word_info[0] == 1) & (word_info[1] == 0) & (word_info[2] == 1)
+
+def one_side_no_tile(word_info):
+    left_gap = (word_info[0] > 1) & (word_info[1] == 0) & (word_info[2] == 1)
+    right_gap = (word_info[0] == 1) & (word_info[1] == 0) & (word_info[2] > 1)
+    return left_gap | right_gap
+
+def gap_no_tile(word_info):
+    return (word_info[0] > 1) & (word_info[1] == 0) & (word_info[2] > 1)
+
+def perfect_tile(word_info):
+    return (word_info[0] == 1) & (word_info[1] > 0) & (word_info[2] == 1)
+
+def one_side_tile(word_info):
+    left_gap = (word_info[0] > 1) & (word_info[1] > 0) & (word_info[2] == 1)
+    right_gap = (word_info[0] == 1) & (word_info[1] > 0) & (word_info[2] > 1)
+    return left_gap | right_gap
+
+def worst_case(word_info):
+    return (word_info[0] > 1) & (word_info[1] > 0) & (word_info[2] > 1)
+
+def classify_errors(real, pred):
+    # If real is (batch, seq_length) and pred is (batch, seq_length, 1)
+    # Then this should return (batch, 6) 
+    # Where second index identifies error types for words in this predicted sentence
+    
+    # As of TF 2.10 tf.map_fn is just a niceity around tf.while_loop
+    batch_size = tf.shape(pred)[0]
+    res = tf.TensorArray(tf.float64, size=batch_size, dynamic_size=False)
+    for sample_index in tf.range(batch_size):
+        error_types = np.zeros(shape=(6,))
+        word_locs = row_parse_real_word_boundaries(real[sample_index,...])
+        match_info = row_indices_of_wrapping_boundaries(pred[sample_index,...], word_locs)
+        num_words = tf.shape(match_info)[0]
+        for word_index in tf.range(num_words):
+            word_info = match_info[word_index,:]
+            if invalid_gaps(word_info):
+                raise ValueError(f"Cannot have a left/right gap < 0: {word_info}")
+            elif no_error(word_info):
+                error_types[0] += 1
+            elif one_side_no_tile(word_info):
+                error_types[1] += 1
+            elif gap_no_tile(word_info):
+                error_types[2] += 1
+            elif perfect_tile(word_info):
+                error_types[3] += 1
+            elif one_side_tile(word_info):
+                error_types[4] += 1
+            elif worst_case(word_info):
+                error_types[5] += 1
+        error_types = error_types
+        res = res.write(sample_index, tf.constant(error_types, dtype=res.dtype))
+    return res.stack()
+
+class VotingExpertsMetric(tf.keras.metrics.Metric):
+    def __init__(self, name="voting_experts", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.error_types = self.add_weight(name="error_types", shape=(6,))
+
+    def update_state(self, real, pred):
+        errors = classify_errors(real, pred)
+        self.error_types.assign_add(tf.cast(tf.reduce_sum(errors, axis=0), self.error_types.dtype)) # Add across batch
+        
+    def result(self):
+        normalized = self.error_types/tf.reduce_sum(self.error_types)
+        return {
+            'good': normalized[0],
+            'one-sided-gap': normalized[1],
+            'two-sided-gap': normalized[2],
+            'tiled-no-gap': normalized[3],
+            'tiled-one-gap': normalized[4],
+            'totally-wrong': normalized[5]
+        }
 
 # # Embedding defn
 def positional_encoding(length, depth):
@@ -198,7 +471,8 @@ class NoTwoSpaces(tf.keras.layers.Layer):
         # We now work on a single row, if two consecutive 1s appear we
         # want to replace with 0 -> only 1*1 =/= 0
         return tf.scan(lambda a, t: t*(1-tf.cast(a>self.threshold, a.dtype)*tf.cast(t>self.threshold, t.dtype)), row)
-        
+    
+    @tf.function
     def call(self, x): # Do I need to support masking?
         return tf.map_fn(
             lambda row: self.remove_consecutive_ones(row),
@@ -459,6 +733,30 @@ class Decoder(tf.keras.layers.Layer):
         # The shape of x is `(batch_size, target_seq_len, d_model)`.
         return x, attention_weights
 
+
+train_loss = tf.keras.metrics.Mean(name='train_loss')
+train_loss_low = tf.keras.metrics.Mean(name='train_loss_low')
+train_loss_med = tf.keras.metrics.Mean(name='train_loss_med')
+train_loss_high = tf.keras.metrics.Mean(name='train_loss_high')
+
+train_token_accuracy = tf.keras.metrics.Mean(name='train_token_accuracy')
+train_sentence_accuracy = tf.keras.metrics.Mean(name='train_token_accuracy')
+train_AUC = tf.keras.metrics.AUC(name="train_AUC", from_logits=False)
+train_Voting_Experts = VotingExpertsMetric()
+
+train_step_signature = [
+    (
+        (
+            tf.TensorSpec(shape=(None, ), dtype=tf.string),
+            tf.TensorSpec(shape=(None, ), dtype=tf.string)
+        ),
+        tf.TensorSpec(shape=(None, MAX_CHARS-1), dtype=tf.int64),
+    )
+]
+train_writer = tf.summary.create_file_writer(TENSORBOARD_DIR + "train/")
+
+# # Actual model
+
 class Transformer(tf.keras.Model):
     def __init__(self,
                *,
@@ -466,8 +764,8 @@ class Transformer(tf.keras.Model):
                d_model, # Input/output dimensionality.
                num_attention_heads,
                dff, # Inner-layer dimensionality.
-               input_tokenizer, # Input (Portuguese) vocabulary size.
-               target_tokenizer, # Target (English) vocabulary size.
+               input_tokenizer,
+               target_tokenizer,
                dropout_rate=0.1,
                classification_threshold=0.5
                ):
@@ -493,8 +791,7 @@ class Transformer(tf.keras.Model):
           )
 
         # The final linear layer.
-        self.dense = tf.keras.layers.Dense(1, activation="sigmoid")
-        
+        self.dense = tf.keras.layers.Dense(1, activation="sigmoid")        
         self.final_layer = NoTwoSpaces(classification_threshold)
 
     def call(self, inputs, training):
@@ -513,226 +810,48 @@ class Transformer(tf.keras.Model):
         final_output = self.dense(dec_output)  # Shape `(batch_size, tar_seq_len, 1)`.
         no_two_spaces = self.final_layer(final_output)
         # Return the final output and the attention weights.
-        return no_two_spaces, attention_weights
+        return final_output, attention_weights
+
+    @tf.function(input_signature=train_step_signature)
+    def train_step(self, data):
+        inputs, labels = data
+        batch_size = tf.shape(labels)[0]
+        (inp, tar_inp) = inputs
+        real, real_mask = get_real(labels)
+
+        with tf.GradientTape() as tape:
+            preds, _ = self(inputs, training = True)
+            predicted_mask = used_all_characters_mask(labels, preds)
+            loss, loss_dist = loss_function(real, preds, predicted_mask | real_mask)
+        
+        gradients = tape.gradient(loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        lq, med, uq = tfp.stats.percentile(loss_dist, 10), tfp.stats.percentile(loss_dist, 50), tfp.stats.percentile(loss_dist, 90)
+        train_loss_low(med-lq)
+        train_loss_med(med)
+        train_loss_high(uq-med)
+        train_loss(loss)
+        train_token_accuracy(token_accuracy(labels, preds))
+        train_sentence_accuracy(sentence_accuracy(labels, preds))
+        metrics = {
+            'loss': train_loss.result(),
+            'median loss': train_loss_med.result(),
+            'bottom decile delta': train_loss_low.result(),
+            'top decile delta': train_loss_high.result(),
+            'token accuracy': train_token_accuracy.result(),
+            'sentence accuracy': train_sentence_accuracy.result(),
+        }
+        with train_writer.as_default(step=self._train_counter):
+            for k, v in metrics.items():
+                tf.summary.scalar(k, v)
+        return metrics
+    
+    
 
 
 # # Model creation + training
-
-# ## Loss and metric functions
-
-loss_object = tf.keras.losses.BinaryCrossentropy(
-    from_logits=False,
-    reduction=tf.keras.losses.Reduction.NONE # Need no reduction so we can mask out irrelevant predictions
-)
-
-def get_real(real_raw):
-    # Function to convert the 0 mask and 1/2 category tokens into a mask 
-    # and 0/1 tokens (suitable for binary cross-entropy)
-    # Mask will have same dtype as real
-    mask = tf.math.logical_not(tf.math.equal(real_raw, 0))
-    mask = tf.cast(mask, real_raw.dtype)
-    real = real_raw - 1*mask
-    return real, mask
-
-def used_all_characters_mask(real_raw, pred):
-    # Lets initially assume we are working with one example
-    # can think about the batching code later
-    real, _ = get_real(real_raw)
-    real_letters = 1 - real
-    real_letter_count = tf.math.cumsum(real_letters)
-    letters_in_phrase = real_letter_count[-1]
-    
-    if tf.shape(pred)[-1] == 1:
-        pred = tf.squeeze(pred, axis=-1)
-    boundaries = tf.cast(pred > CLASS_THRESHOLD, real.dtype)
-    pred_letters = 1 - boundaries
-    pred_letter_count = tf.math.cumsum(pred_letters, axis=-1)
-    return tf.cast(pred_letter_count <= letters_in_phrase, real.dtype)
-
-def loss_function(real, pred, mask):
-    # Expects real in form (0,1,0,...) with last tokens just 0
-    batch_size = tf.shape(real)[0]   
-    if tf.shape(pred)[-1] == 1:
-        pred = tf.squeeze(pred, axis=-1)
-    pred *= tf.cast(mask, dtype=pred.dtype)
-    loss_ = loss_object(real, pred)
-    # Dont divide by tf.cast(tf.reduce_sum(mask), dtype=loss_.dtype) 
-    # as we hope that the masked (0 + eps) output matching the real 0 is good enough to not fit to masked data
-    return tf.reduce_mean(loss_), loss_
-
-def token_accuracy(real_raw, pred):
-    # Assuming pred is (batch, seq_length, 1)
-    real, real_mask = get_real(real_raw)
-    predicted_mask = used_all_characters_mask(real_raw, pred)
-    pred = tf.squeeze(pred, axis=-1)
-    pred *= tf.cast(predicted_mask, pred.dtype)
-    accuracies = tf.equal(real, tf.cast( pred > CLASS_THRESHOLD, real.dtype))
-    accuracies = tf.cast(accuracies, dtype=predicted_mask.dtype)
-    accuracies *= predicted_mask # Dont think this is strictly necessary
-    return tf.reduce_sum(accuracies)/tf.reduce_sum(predicted_mask)
-
-def sentence_accuracy(real_raw, pred):
-    real, mask = get_real(real_raw)
-    pred = tf.squeeze(pred, axis=-1)
-    accuracies = tf.equal(real, tf.cast(pred > CLASS_THRESHOLD, real.dtype))
-    accuracies = tf.cast(accuracies, dtype=mask.dtype)
-    accuracies *= mask
-    accuracies += 1 - mask # A bit worried about the double accuracy of this but w/e
-    sentence_accuracies = tf.reduce_prod(accuracies, axis=-1)
-    return tf.reduce_sum(sentence_accuracies)/tf.cast(tf.shape(real)[0], sentence_accuracies.dtype)
-
-def row_parse_real_word_boundaries(real_row):
-    # Given (seq_length,) we want to return a tensor of shape
-    # (no_words, 2) where first index chooses a word and 2nd index chooses which
-    # numbered letter starts and ends the word
-    real, _ = get_real(real_row)
-    no_words = tf.reduce_sum(real, axis=-1) # We don't need to find the first boundary
-    real = tf.roll(real, shift=1, axis=-1)
-    real_letters = 1 - real
-    real_letter_count = tf.cast(tf.math.cumsum(real_letters), real.dtype)
-    words = []
-    start_index = tf.cast(0, tf.int64)
-    for end_index in tf.where(real):
-        end_index = end_index[0]
-        words.extend([real_letter_count[start_index],real_letter_count[end_index]])
-        start_index = end_index + 1
-    res = tf.RaggedTensor.from_uniform_row_length(words, 2)
-    return res
-
-def batch_parse_real_word_boundaries(real):
-    # Given (batch, seq_length) we want to return a tensor of shape
-    # (batch, no_words, 2) where second index chooses a word and 3rd index chooses which
-    # numbered letter starts and ends the word
-    batch_dim = tf.shape(real)[0]
-    return tf.map_fn(row_parse_real_word_boundaries, real,
-                    fn_output_signature=tf.RaggedTensorSpec(shape=[None, 2],
-                                                            dtype=tf.float32))
-
-def row_indices_of_wrapping_boundaries(pred_row, real_word_boundaries):
-    # If real_word_boundaries is (no_words, 2) and pred is (seq_length, 1)
-    # Then this should return (no_words, 3) second index idenitfying
-    # left gap, mid word gap, right gap
-    if tf.shape(pred_row)[-1] == 1:
-        pred_row = tf.squeeze(pred_row, axis=-1)
-    pred_spaces = tf.cast(pred_row > CLASS_THRESHOLD, tf.int64)
-    seq_length = tf.cast(tf.shape(pred_row)[0], dtype=pred_spaces.dtype)
-    pred_indices = tf.range(seq_length, dtype=pred_spaces.dtype)
-    # Mask out last prediction before rolling
-    pred_spaces *= tf.cast(pred_indices < seq_length - 1, dtype=pred_spaces.dtype)
-    pred_spaces = tf.roll(pred_spaces, shift=1, axis=-1)
-    pred_letters = 1 - pred_spaces 
-    pred_letter_count = tf.math.cumsum(pred_letters)
-    pred_letter_count -= pred_spaces*tf.cast(tf.shape(pred_row)[0]*2, pred_spaces.dtype)
-    wrapping_boundaries = []
-    for word_index in tf.range(tf.shape(real_word_boundaries)[0]):
-        word = tf.cast(real_word_boundaries[word_index,...], pred_spaces.dtype)
-        start_count, end_count = tf.unstack(word)
-        word_mask = (pred_letter_count >= start_count) & (pred_letter_count <= end_count)
-        letter_indices = tf.where(word_mask)
-        if tf.shape(letter_indices)[0] >= tf.cast((end_count - start_count)+1, tf.int32):
-            start_index, end_index = letter_indices[0][0], letter_indices[-1][0]
-        else:
-            # Can't find the word in this prediction - means we are definitely fuarked
-            # We pretend it is a total failure by saying the string is the whole string minus two either side so falls
-            # into cat 6 error
-            start_index, end_index = tf.constant(2, dtype=pred_spaces.dtype), tf.cast(tf.shape(pred_spaces)[0]-2, dtype=pred_spaces.dtype)
-        left_mask = tf.cast(pred_indices < start_index, pred_spaces.dtype)
-        right_mask = tf.cast(pred_indices > end_index, pred_spaces.dtype)
-        if tf.shape(tf.where(tf.cast(left_mask & pred_spaces, tf.int64)))[0] > 0:
-            left_boundary = tf.where(tf.cast(left_mask & pred_spaces, tf.int64))[-1][0]
-        else:
-            left_boundary = tf.constant(-1, dtype=pred_spaces.dtype)
-        if tf.shape(tf.where(tf.cast(right_mask & pred_spaces, tf.int64)))[0] > 0:
-            right_boundary = tf.where(tf.cast(right_mask & pred_spaces, tf.int64))[0][0]
-        else:
-            right_boundary = tf.cast(tf.shape(pred_spaces)[0]+1, dtype=pred_spaces.dtype)
-        left_gap = start_index - left_boundary
-        letter_gap = end_index - start_index
-        letter_delta = letter_gap - (end_count - start_count)
-        right_gap = right_boundary - end_index
-        wrapping_boundaries.extend([left_gap, letter_delta, right_gap])
-    return tf.RaggedTensor.from_uniform_row_length(wrapping_boundaries, 3)    
-
-def invalid_gaps(word_info):
-    return (word_info[0] < 1) | (word_info[2] < 1)
-
-def no_error(word_info):
-    return (word_info[0] == 1) & (word_info[1] == 0) & (word_info[2] == 1)
-
-def one_side_no_tile(word_info):
-    left_gap = (word_info[0] > 1) & (word_info[1] == 0) & (word_info[2] == 1)
-    right_gap = (word_info[0] == 1) & (word_info[1] == 0) & (word_info[2] > 1)
-    return left_gap | right_gap
-
-def gap_no_tile(word_info):
-    return (word_info[0] > 1) & (word_info[1] == 0) & (word_info[2] > 1)
-
-def perfect_tile(word_info):
-    return (word_info[0] == 1) & (word_info[1] > 0) & (word_info[2] == 1)
-
-def one_side_tile(word_info):
-    left_gap = (word_info[0] > 1) & (word_info[1] > 0) & (word_info[2] == 1)
-    right_gap = (word_info[0] == 1) & (word_info[1] > 0) & (word_info[2] > 1)
-    return left_gap | right_gap
-
-def worst_case(word_info):
-    return (word_info[0] > 1) & (word_info[1] > 0) & (word_info[2] > 1)
-
-def classify_errors(real, pred):
-    # If real is (batch, seq_length) and pred is (batch, seq_length, 1)
-    # Then this should return (batch, 6) 
-    # Where second index identifies error types for words in this predicted sentence
-    
-    # As of TF 2.10 tf.map_fn is just a niceity around tf.while_loop
-    batch_size = tf.shape(pred)[0]
-    res = tf.TensorArray(tf.float64, size=batch_size, dynamic_size=False)
-    for sample_index in tf.range(batch_size):
-        error_types = np.zeros(shape=(6,))
-        word_locs = row_parse_real_word_boundaries(real[sample_index,...])
-        match_info = row_indices_of_wrapping_boundaries(pred[sample_index,...], word_locs)
-        num_words = tf.shape(match_info)[0]
-        for word_index in tf.range(num_words):
-            word_info = match_info[word_index,:]
-            if invalid_gaps(word_info):
-                raise ValueError(f"Cannot have a left/right gap < 0: {word_info}")
-            elif no_error(word_info):
-                error_types[0] += 1
-            elif one_side_no_tile(word_info):
-                error_types[1] += 1
-            elif gap_no_tile(word_info):
-                error_types[2] += 1
-            elif perfect_tile(word_info):
-                error_types[3] += 1
-            elif one_side_tile(word_info):
-                error_types[4] += 1
-            elif worst_case(word_info):
-                error_types[5] += 1
-        error_types = error_types
-        res = res.write(sample_index, tf.constant(error_types, dtype=res.dtype))
-    return res.stack()
-
-class VotingExpertsMetric(tf.keras.metrics.Metric):
-    def __init__(self, name="voting_experts", **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.error_types = self.add_weight(name="error_types", shape=(6,))
-
-    def update_state(self, real, pred):
-        errors = classify_errors(real, pred)
-        self.error_types.assign_add(tf.cast(tf.reduce_sum(errors, axis=0), self.error_types.dtype)) # Add across batch
-        
-    def result(self):
-        normalized = self.error_types/tf.reduce_sum(self.error_types)
-        return {
-            'good': normalized[0],
-            'one-sided-gap': normalized[1],
-            'two-sided-gap': normalized[2],
-            'tiled-no-gap': normalized[3],
-            'tiled-one-gap': normalized[4],
-            'totally-wrong': normalized[5]
-        }
-    
-
-# ## Hyperparams and actual model
+# ## Hyperparams and model instantiation
+logger.debug("Creating transformer")
 transformer = Transformer(
     num_layers=NUM_LAYERS,
     d_model=D_MODEL,
@@ -765,107 +884,37 @@ learning_rate = CustomSchedule(D_MODEL)
 optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
                                      epsilon=1e-9)
 
-train_loss = tf.keras.metrics.Mean(name='train_loss')
-train_loss_low = tf.keras.metrics.Mean(name='train_loss_low')
-train_loss_med = tf.keras.metrics.Mean(name='train_loss_med')
-train_loss_high = tf.keras.metrics.Mean(name='train_loss_high')
 
-train_token_accuracy = tf.keras.metrics.Mean(name='train_token_accuracy')
-train_sentence_accuracy = tf.keras.metrics.Mean(name='train_token_accuracy')
-train_AUC = tf.keras.metrics.AUC(name="train_AUC", from_logits=False)
-train_Voting_Experts = VotingExpertsMetric()
+model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+    filepath=CHECKPOINT_DIR,
+    monitor='token accuracy',
+    mode='max',
+    save_freq=10,
+    save_best_only=True,
+    save_weights_only=True)
 
-checkpoint_path = f"./checkpoints/"
+tboard_callback = tf.keras.callbacks.TensorBoard(log_dir = TENSORBOARD_DIR,
+                                                 histogram_freq = 1,
+                                                 profile_batch = '5,10',
+                                                 update_freq='batch',
+                                                 write_steps_per_second=True,
+                                                )
 
-ckpt = tf.train.Checkpoint(transformer=transformer,
-                           optimizer=optimizer)
-
-ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
 
 # If a checkpoint exists, restore the latest checkpoint.
-if ckpt_manager.latest_checkpoint:
-    ckpt.restore(ckpt_manager.latest_checkpoint)
+if len(list(pathlib.Path(CHECKPOINT_DIR).glob("*"))) > 0:
+    transformer.load_weights(CHECKPOINT_DIR)
     logger.info('Latest checkpoint restored!!')
 
+callbacks=[model_checkpoint_callback,]
+if DEBUG:
+    callbacks.append(tboard_callback)
 
-# ## Training step
-
-
-train_step_signature = [
-    (
-         tf.TensorSpec(shape=(None, ), dtype=tf.string),
-         tf.TensorSpec(shape=(None, ), dtype=tf.string)),
-    tf.TensorSpec(shape=(None, MAX_CHARS-1), dtype=tf.int64), # We dont care to predict if first character is a space
-]
-
-# The `@tf.function` trace-compiles train_step into a TF graph for faster
-# execution. The function specializes to the precise shape of the argument
-# tensors. To avoid re-tracing due to the variable sequence lengths or variable
-# batch sizes (the last batch is smaller), use input_signature to specify
-# more generic shapes.
-
-@tf.function(input_signature=train_step_signature)
-def train_step(inputs, labels):
-    batch_size = tf.shape(labels)[0]
-    (inp, tar_inp) = inputs
-    real, real_mask = get_real(labels)
-    with tf.GradientTape() as tape:
-        preds, _ = transformer([inp, tar_inp],
-                                     training = True)
-        predicted_mask = tf.TensorArray(labels.dtype, size=batch_size, dynamic_size=False)
-        for sample_index in tf.range(batch_size):
-            predicted_mask = predicted_mask.write(sample_index, used_all_characters_mask(labels[sample_index,...], preds[sample_index,...]))
-        predicted_mask = predicted_mask.stack()
-        loss, loss_dist = loss_function(real, preds, predicted_mask) # We get mask from reals
-    gradients = tape.gradient(loss, transformer.trainable_variables)
-    optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
-    lq, med, uq = tfp.stats.percentile(loss_dist, 10), tfp.stats.percentile(loss_dist, 50), tfp.stats.percentile(loss_dist, 90)
-    train_loss_low(med-lq)
-    train_loss_med(med)
-    train_loss_high(uq-med)
-    train_loss(loss)
-    train_token_accuracy(token_accuracy(labels, preds))
-    train_token_accuracy(sentence_accuracy(labels, preds))
-    return preds
-
-# # The actual training
-
-for epoch in range(EPOCHS):
-    start = time.time()
-
-    train_loss.reset_states()
-    train_token_accuracy.reset_states()
-    train_sentence_accuracy.reset_states()
-    train_AUC.reset_states()
-
-    for (batch, (inp, tar)) in enumerate(train_ds):
-        batch_start = time.time()
-        preds = train_step(inp, tar)
-        
-        if batch % 10 == 0:
-            end = time.time()
-            train_AUC(tar, preds)
-            after_auc = time.time()
-            if batch % 11 == 0:
-                    train_Voting_Experts.update_state(tar, preds)
-                    error_types = {k: f"{v:.2f}" for k, v in train_Voting_Experts.result().items()}
-                    after_ve = time.time()
-                    logger.info(f"Voting_experts ({after_ve - after_auc:.2f}s to generate): {error_types}")
-            logger.info((f"\nEpoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} ({train_loss_low.result():.4f}-{train_loss_med.result():.4f}-{train_loss_high.result():.4f})"
-                f" | Token Accuracy {train_token_accuracy.result():.4f} Sentence accuracy {train_sentence_accuracy.result()}"))
-            logger.info(f" AUC {train_AUC.result():.4f}")
-            logger.info(f"\nTime taken for 1 batch: {end - batch_start:.2f}, extra {after_auc - end:.2f} spent on AUC")
-            
-        if (epoch - 1) % 5 == 0:
-            ckpt_save_path = ckpt_manager.save()
-            logger.info(f'\nSaved checkpoint for epoch {epoch+1} at {ckpt_save_path}')
-        logger.debug(".")
-    
-    train_Voting_Experts.update_state(tar, preds)
-    error_types = {k: f"{v:.2f}" for k, v in train_Voting_Experts.result().items()}
-    logger.info(f"Voting_experts: {error_types}")
-    logger.info((f"\nEpoch {epoch + 1} Batch {batch} Loss {train_loss.result():.4f} ({train_loss_low.result():.4f}-{train_loss_med.result():.4f}-{train_loss_high.result():.4f})"
-                f" | Token Accuracy {train_token_accuracy.result():.4f} Sentence accuracy {train_sentence_accuracy.result()}"))
-    logger.info(f'\nTime taken for 1 epoch: {time.time() - start:.2f} secs\n')
-
-ckpt_manager.save()
+logger.debug("Compiling model")
+transformer.compile(optimizer=optimizer, run_eagerly=True)
+logger.debug("Fitting model")
+transformer.fit(
+    train_ds,
+    callbacks=callbacks,
+    epochs=1
+    )
