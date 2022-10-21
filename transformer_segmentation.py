@@ -166,13 +166,6 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
 train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 test_ds = test.batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 
-# i = tf.constant(0)
-# avg = tf.constant(0.)
-# for x in train_ds.map(fraction_of_chars_used):
-#     i += 1
-#     avg += x
-
-# tf.print("Average usage of MAX_CHARS", avg/tf.cast(i, avg.dtype))
 if DEBUG:
     def label_stats(inputs, labels):
         mask = tf.cast(labels != 0, tf.float32)

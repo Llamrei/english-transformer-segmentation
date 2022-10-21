@@ -77,5 +77,3 @@ class TestInputPipeline(tf.test.TestCase):
             self.assertBetween(av_spaces, 0.4, 0.6) # TODO: figure out a proper 99% CI
             self.assertAllEqual(expected_output[0][0], res[0][0])
             self.assertAllEqual(expected_output[0][1], res[0][1])
-
-
