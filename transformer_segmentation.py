@@ -70,8 +70,8 @@ else:
 # Data definition params 
 JOINING_PUNC = r"([-'`])"
 SPLITTING_PUNC = r'([!"#$%&()\*\+,\./:;<=>?@\[\\\]^_{|}~])'
-NGRAM = 4
-MAX_CHARS = 1000 if not DEBUG else 10
+NGRAM = 1
+MAX_CHARS = 1000 if not DEBUG else 100
 BATCH_SIZE = 16 if not DEBUG else 2
 
 # Metric params
@@ -90,7 +90,6 @@ EPOCHS = 1
 visible_devices = tf.config.get_visible_devices('GPU')
 logger.info(f"Num GPUs visible:{len(visible_devices)}")
 tf.config.set_visible_devices(visible_devices[GPU_FROM:GPU_TO],'GPU')
-# tf.config.set_visible_devices([],'GPU')
 
 visible_devices = tf.config.get_visible_devices('GPU')
 logger.info(f"Num GPUs to be used: {len(visible_devices)}")
@@ -159,8 +158,8 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
         logger.info("Running a negative control experiment")
         present = labels != 0
         labels = tf.random.stateless_binomial(shape=tf.shape(labels), seed=[1507, 1997], counts=1, probs=0.5) + 1
-        labels = tf.cast(present, labels.dtype)*labels
         labels = tf.cast(labels, tf.int64)
+        labels = tf.cast(present, labels.dtype)*labels
     return (x, y), labels
 
 train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
@@ -168,6 +167,7 @@ test_ds = test.batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_sp
 
 # tf.print("Average usage of MAX_CHARS", avg/tf.cast(i, avg.dtype))
 if DEBUG:
+    logger.debug("Generating pipepline label stats")
     def label_stats(inputs, labels):
         mask = tf.cast(labels != 0, tf.float32)
         spaces = tf.cast(labels == 2, tf.float32)
@@ -182,17 +182,15 @@ if DEBUG:
     avg_char_usage = tf.constant(0.)
     avg_no_spaces = tf.constant(0.)
     i = tf.constant(0)
-    for char_usage, no_spaces in train_ds.map(label_stats):
+    for char_usage, no_spaces in train_ds.take(100).map(label_stats):
         avg_char_usage += char_usage
         avg_no_spaces += no_spaces
         i += 1
     i = tf.cast(i, tf.float32)
     avg_char_usage /= i
     avg_no_spaces /= i
-    tf.print("Avg char_usage", avg_char_usage)
-    tf.print("Avg no spaces", avg_no_spaces)
-
-
+    logger.debug(f"Avg char_usage {avg_char_usage}")
+    logger.debug(f"Avg no spaces {avg_no_spaces}")
 
 
 logger.info("Training tokenizers")
@@ -226,10 +224,16 @@ def get_with_spaces(inputs, labels):
 
 
 if RUN_AS_SCRIPT:
-    inputs = train_ds.map(get_without_spaces)
-    outputs = train_ds.map(get_with_spaces)
-    encoder_tokenizer.adapt(inputs)
-    decoder_tokenizer.adapt(outputs)
+    if DEBUG:
+        inputs = train_ds.take(10).map(get_without_spaces)
+        outputs = train_ds.take(10).map(get_with_spaces)
+        encoder_tokenizer.adapt(inputs)
+        decoder_tokenizer.adapt(outputs)
+    else:
+        inputs = train_ds.map(get_without_spaces)
+        outputs = train_ds.map(get_with_spaces)
+        encoder_tokenizer.adapt(inputs)
+        decoder_tokenizer.adapt(outputs)
 
 # # Metrics and losses
 loss_object = tf.keras.losses.BinaryCrossentropy(
@@ -294,6 +298,7 @@ def token_accuracy(real_raw, pred):
     real, real_mask = get_real(real_raw)
     predicted_mask = used_all_characters_mask(real_raw, pred)
     mask = tf.cast(predicted_mask | real_mask, real.dtype)
+    # tf.print(real_raw, real, pred, mask, summarize=-1)
     if tf.shape(pred)[-1] == 1:
         pred = tf.squeeze(pred, axis=-1)
     pred *= tf.cast(mask, pred.dtype)

@@ -4,6 +4,7 @@ import tensorflow as tf
 from .transformer_segmentation import NGRAM
 from .transformer_segmentation import MAX_CHARS
 from .transformer_segmentation import strip_spaces_and_set_predictions
+from .transformer_segmentation import token_accuracy
 
 
 class TestInputPipeline(tf.test.TestCase):
@@ -77,3 +78,6 @@ class TestInputPipeline(tf.test.TestCase):
             self.assertBetween(av_spaces, 0.4, 0.6) # TODO: figure out a proper 99% CI
             self.assertAllEqual(expected_output[0][0], res[0][0])
             self.assertAllEqual(expected_output[0][1], res[0][1])
+    
+    def test_token_accuracy(self):
+        pass
