@@ -52,11 +52,17 @@ file_output.setLevel(logging.DEBUG)
 file_output.setFormatter(formatter)
 logger.addHandler(file_output)
 
-logger.debug(f"Eager: {tf.executing_eagerly()}")
+logger.info(f"Eager: {tf.executing_eagerly()}")
 
 # Running params
-GPU_FROM = int(sys.argv[1])
-GPU_TO = int(sys.argv[2])
+if __name__ == "__main__":
+    RUN = True
+    GPU_FROM = int(sys.argv[1])
+    GPU_TO = int(sys.argv[2])
+else:
+    RUN = False
+    GPU_FROM = 0
+    GPU_TO = 0
 
 # Data definition params 
 JOINING_PUNC = r"([-'`])"
@@ -77,21 +83,17 @@ DROPOUT_RATE = 0.3
 
 # Training params
 EPOCHS = 1
-MAX_BATCHES = False
 
-
-DEBUG=True
-if DEBUG:
-    # tf.debugging.set_log_device_placement(True)
-    MAX_BATCHES = 23
+DEBUG = True
+NEGATIVE_CONTROL = True
 
 visible_devices = tf.config.get_visible_devices('GPU')
-logger.debug(f"Num GPUs visible:{len(visible_devices)}")
+logger.info(f"Num GPUs visible:{len(visible_devices)}")
 tf.config.set_visible_devices(visible_devices[GPU_FROM:GPU_TO],'GPU')
 # tf.config.set_visible_devices([],'GPU')
 
 visible_devices = tf.config.get_visible_devices('GPU')
-logger.debug(f"Num GPUs to be used: {len(visible_devices)}")
+logger.info(f"Num GPUs to be used: {len(visible_devices)}")
 
 
 # # Data preprocessing
@@ -101,10 +103,10 @@ logger.debug(f"Num GPUs to be used: {len(visible_devices)}")
 # How to handle punctuation and numbers?
 
 # For real deal probably want the 'lm1b' dataset
-logger.debug("Loading data")
+logger.info("Loading data")
 train, test = tfds.load('ag_news_subset', split="train"), tfds.load('ag_news_subset', split="test")
 
-logger.debug("Preprocessing data")
+logger.info("Preprocessing data")
 punc_mapping = {ord(x):x for x in string.punctuation}
 entity_mapping = {f" ?{k}": v for k, v in html.entities.html5.items() if k.endswith(";") and v in string.punctuation}
 punc_mapping = {f' ?&?#?{k};': v for k, v in punc_mapping.items()}
@@ -119,7 +121,7 @@ def unescape(text):
 def join_title_desc(text):
     return text['title'] + ' ' + text['description']
 
-def strip_spaces_and_set_predictions(text):
+def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
     x = tf.strings.lower(text)
     x = tf.strings.substr(x, 0, MAX_CHARS)
     # We want to sometimes replace punctuation with a space : "bad.sentence" -> "bad. sentence"
@@ -132,7 +134,7 @@ def strip_spaces_and_set_predictions(text):
     y = tf.strings.reduce_join(no_whitespace_list, separator=" ", axis=-1)
     
     padding = tf.broadcast_to("#"*(NGRAM-1), (tf.shape(x)[0],) )
-    x = tf.strings.reduce_join([padding, x], axis=0)
+    x = tf.strings.reduce_join([padding, x], axis=0) # Dont actually need this on the input
     y = tf.strings.reduce_join([padding, y], axis=0)
     
     final_boundary = tf.broadcast_to(" ", (tf.shape(x)[0],) )
@@ -142,7 +144,7 @@ def strip_spaces_and_set_predictions(text):
     chars = tf.strings.unicode_split(y, "UTF-8")
     char_ngrams = tf.strings.ngrams(chars, ngram_width=NGRAM, separator="")
     labels = tf.strings.regex_full_match(char_ngrams, ".* ")
-    labels = tf.cast(labels, 'int64')+1 # Add 1 to be able to tell difference between padding and prediction
+    labels = tf.cast(labels, tf.int64)+1 # Add 1 to be able to tell difference between padding and prediction
     labels = labels.to_tensor(default_value=0, shape=[None, MAX_CHARS])
     # Roll so we predict for _future_ spaces not spaces in current token (if we knew space in current token we wouldnt have anything to solve)
     labels = tf.roll(labels, shift=-1, axis=-1)
@@ -153,16 +155,53 @@ def strip_spaces_and_set_predictions(text):
     # labels = tf.random.experimental.stateless_shuffle(labels, seed=[1507, 1997]) # shuffles batch
 
     # Truly random
-    # present = labels != 0
-    # labels = tf.random.stateless_binomial(shape=tf.shape(labels), seed=[1507, 1997], counts=1, probs=0.5) + 1
-    # labels = tf.cast(present, labels.dtype)*labels
-    # labels = tf.cast(labels, tf.int64)
+    if negative_control:
+        logger.info("Running a negative control experiment")
+        present = labels != 0
+        labels = tf.random.stateless_binomial(shape=tf.shape(labels), seed=[1507, 1997], counts=1, probs=0.5) + 1
+        labels = tf.cast(present, labels.dtype)*labels
+        labels = tf.cast(labels, tf.int64)
     return (x, y), labels
 
 train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 test_ds = test.batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 
-logger.debug("Training tokenizers")
+# i = tf.constant(0)
+# avg = tf.constant(0.)
+# for x in train_ds.map(fraction_of_chars_used):
+#     i += 1
+#     avg += x
+
+# tf.print("Average usage of MAX_CHARS", avg/tf.cast(i, avg.dtype))
+if DEBUG:
+    def label_stats(inputs, labels):
+        mask = tf.cast(labels != 0, tf.float32)
+        spaces = tf.cast(labels == 2, tf.float32)
+        def batchwise_mean(tensor, mask):
+            return tf.reduce_mean(tf.reduce_sum(tensor, axis=-1)/tf.reduce_sum(mask, axis=-1))
+        
+        return (
+            batchwise_mean(mask, tf.ones_like(mask)),
+            batchwise_mean(spaces, mask)
+        )
+
+    avg_char_usage = tf.constant(0.)
+    avg_no_spaces = tf.constant(0.)
+    i = tf.constant(0)
+    for char_usage, no_spaces in train_ds.map(label_stats):
+        avg_char_usage += char_usage
+        avg_no_spaces += no_spaces
+        i += 1
+    i = tf.cast(i, tf.float32)
+    avg_char_usage /= i
+    avg_no_spaces /= i
+    tf.print("Avg char_usage", avg_char_usage)
+    tf.print("Avg no spaces", avg_no_spaces)
+
+
+
+
+logger.info("Training tokenizers")
 # # Defining tokenizers
 # Want to be able to encode every n-gram of lowercase letters and however many prescribed punctuation characters
 def tokenizer_vocab_size(num_punc):
@@ -191,10 +230,12 @@ def get_without_spaces(inputs, labels):
 def get_with_spaces(inputs, labels):
     return inputs[1]
 
-inputs = train_ds.map(get_without_spaces)
-outputs = train_ds.map(get_with_spaces)
-encoder_tokenizer.adapt(inputs)
-decoder_tokenizer.adapt(outputs)
+
+if RUN:
+    inputs = train_ds.map(get_without_spaces)
+    outputs = train_ds.map(get_with_spaces)
+    encoder_tokenizer.adapt(inputs)
+    decoder_tokenizer.adapt(outputs)
 
 # # Metrics and losses
 loss_object = tf.keras.losses.BinaryCrossentropy(
@@ -851,7 +892,7 @@ class Transformer(tf.keras.Model):
 
 # # Model creation + training
 # ## Hyperparams and model instantiation
-logger.debug("Creating transformer")
+logger.info("Creating transformer")
 transformer = Transformer(
     num_layers=NUM_LAYERS,
     d_model=D_MODEL,
@@ -910,11 +951,12 @@ callbacks=[model_checkpoint_callback,]
 if DEBUG:
     callbacks.append(tboard_callback)
 
-logger.debug("Compiling model")
-transformer.compile(optimizer=optimizer, run_eagerly=True)
-logger.debug("Fitting model")
-transformer.fit(
-    train_ds,
-    callbacks=callbacks,
-    epochs=1
-    )
+if RUN:
+    logger.info("Compiling model")
+    transformer.compile(optimizer=optimizer, run_eagerly=True)
+    logger.info("Fitting model")
+    transformer.fit(
+        train_ds,
+        callbacks=callbacks,
+        epochs=1
+        )
