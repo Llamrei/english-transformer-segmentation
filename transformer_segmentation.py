@@ -72,7 +72,7 @@ JOINING_PUNC = r"([-'`])"
 SPLITTING_PUNC = r'([!"#$%&()\*\+,\./:;<=>?@\[\\\]^_{|}~])'
 NGRAM = 1
 MAX_CHARS = 1000 if not DEBUG else 100
-BATCH_SIZE = 16 if not DEBUG else 2
+BATCH_SIZE = 32 if not DEBUG else 2
 
 # Metric params
 CLASS_THRESHOLD = 0.5
@@ -85,7 +85,10 @@ NUM_ATTENTION_HEADS = 2
 DROPOUT_RATE = 0.3
 
 # Training params
-EPOCHS = 1
+EPOCHS = 30 if not DEBUG else 300
+STEPS_PER_EPOCH = 100 if not DEBUG else 2
+VALIDATION_STEPS = 50 if not DEBUG else 2
+
 
 visible_devices = tf.config.get_visible_devices('GPU')
 logger.info(f"Num GPUs visible:{len(visible_devices)}")
@@ -308,16 +311,18 @@ def token_accuracy(real_raw, pred):
     accuracies *= mask
     return tf.reduce_mean(tf.reduce_sum(accuracies, axis=-1)/tf.reduce_sum(mask, axis=-1))
 
-def sentence_accuracy(real_raw, pred):
+def sentence_accuracy(labels, pred):
     """
     Takes a batch of labels {0,1,2} and batch of predictions [0,1] and returns whole sentence accuracy across the batch.
 
     We can mask out either following only tokens that are in label or tokens in prediction
     that represent usage of all of the letters. We choose whichever is longer.
+
+    Dont need to do fancy masking because if the whole sentence is correct it will just all line up anyway
+    on the real mask.
     """
-    real, real_mask = get_real(real_raw)
-    predicted_mask = used_all_characters_mask(real_raw, pred)
-    mask = tf.cast(real_mask | predicted_mask, real.dtype)
+    real, real_mask = get_real(labels)
+    mask = tf.cast(real_mask, real.dtype)
     if tf.shape(pred)[-1] == 1:
         pred = tf.squeeze(pred, axis=-1)
     accuracies = tf.equal(real, tf.cast(pred > CLASS_THRESHOLD, real.dtype))
@@ -883,7 +888,7 @@ class Transformer(tf.keras.Model):
                         chars_seen += 1
                     step += 1
                 output = output.write(sample_inx, preds.stack())
-            return output.stack()
+            return output.stack()[..., tf.newaxis]
                 
     @tf.function(input_signature=train_step_signature)
     def train_step(self, data):
@@ -916,6 +921,40 @@ class Transformer(tf.keras.Model):
             for k, v in metrics.items():
                 tf.summary.scalar(k, v)
         return metrics
+    
+    @tf.function(input_signature=train_step_signature)
+    def test_step(self, data):
+        inputs, labels = data
+        real, real_mask = get_real(labels)
+
+        preds = self(inputs, training = False)
+        predicted_mask = used_all_characters_mask(labels, preds)
+        loss, loss_dist = loss_function(real, preds, predicted_mask | real_mask)
+        
+        lq, med, uq = tfp.stats.percentile(loss_dist, 10), tfp.stats.percentile(loss_dist, 50), tfp.stats.percentile(loss_dist, 90)
+        train_loss_low(med-lq)
+        train_loss_med(med)
+        train_loss_high(uq-med)
+        train_loss(loss)
+        train_token_accuracy(token_accuracy(labels, preds))
+        train_sentence_accuracy(sentence_accuracy(labels, preds))
+        metrics = {
+            'loss': train_loss.result(),
+            'median loss': train_loss_med.result(),
+            'bottom decile delta': train_loss_low.result(),
+            'top decile delta': train_loss_high.result(),
+            'token accuracy': train_token_accuracy.result(),
+            'sentence accuracy': train_sentence_accuracy.result(),
+        }
+        with train_writer.as_default(step=self._train_counter):
+            for k, v in metrics.items():
+                tf.summary.scalar(k, v)
+        return metrics
+    
+    @property
+    def metrics(self):
+        return [train_loss, train_loss_med, train_loss_low, train_loss_high, train_token_accuracy, train_sentence_accuracy]
+
     
     
 
@@ -965,8 +1004,8 @@ model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
     save_weights_only=True)
 
 tboard_callback = tf.keras.callbacks.TensorBoard(log_dir = TENSORBOARD_DIR,
-                                                 histogram_freq = 50,
-                                                 profile_batch = '5,50',
+                                                #  histogram_freq = 50,
+                                                 profile_batch = '75,125',
                                                  update_freq='batch',
                                                  write_steps_per_second=True,
                                                  embeddings_freq=50,
@@ -974,7 +1013,7 @@ tboard_callback = tf.keras.callbacks.TensorBoard(log_dir = TENSORBOARD_DIR,
 
 
 # If a checkpoint exists, restore the latest checkpoint.
-if len(list(pathlib.Path(CHECKPOINT_DIR).glob("*"))) > 0:
+if not DEBUG and len(list(pathlib.Path(CHECKPOINT_DIR).glob("*"))) > 0:
     transformer.load_weights(CHECKPOINT_DIR)
     logger.info('Latest checkpoint restored!!')
 
@@ -982,17 +1021,15 @@ callbacks=[model_checkpoint_callback,]
 if DEBUG:
     callbacks.append(tboard_callback)
 
-for x in test_ds.take(1):
-    tf.print(transformer(x[0], training=False))
-
-raise ValueError()
-
 if RUN_AS_SCRIPT:
     logger.info("Compiling model")
-    transformer.compile(optimizer=optimizer, run_eagerly=True)
+    transformer.compile(optimizer=optimizer, run_eagerly=DEBUG)
     logger.info("Fitting model")
     transformer.fit(
         train_ds,
         callbacks=callbacks,
-        epochs=1
+        validation_data=test_ds,
+        steps_per_epoch=STEPS_PER_EPOCH,
+        validation_steps=VALIDATION_STEPS,
+        epochs=EPOCHS
         )
