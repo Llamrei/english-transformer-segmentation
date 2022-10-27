@@ -53,7 +53,7 @@ file_output.setFormatter(formatter)
 logger.addHandler(file_output)
 
 DEBUG = True
-NEGATIVE_CONTROL = True
+NEGATIVE_CONTROL = False
 
 logger.info(f"Eager: {tf.executing_eagerly()}")
 
@@ -94,6 +94,8 @@ tf.config.set_visible_devices(visible_devices[GPU_FROM:GPU_TO],'GPU')
 visible_devices = tf.config.get_visible_devices('GPU')
 logger.info(f"Num GPUs to be used: {len(visible_devices)}")
 
+# strategy = tf.distribute.MirroredStrategy(devices=visible_devices) # Look at https://www.tensorflow.org/tutorials/distribute/custom_training for more guide on how to do this
+
 
 # # Data preprocessing
 # Create dataset that converts texts into rolling trigram windows
@@ -132,12 +134,10 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
     x = tf.strings.reduce_join(no_whitespace_list, separator="", axis=-1)
     y = tf.strings.reduce_join(no_whitespace_list, separator=" ", axis=-1)
     
-    padding = tf.broadcast_to("#"*(NGRAM-1), (tf.shape(x)[0],) )
-    x = tf.strings.reduce_join([padding, x], axis=0) # Dont actually need this on the input
-    y = tf.strings.reduce_join([padding, y], axis=0)
+    y_padding = tf.broadcast_to("#"*(NGRAM-1), (tf.shape(x)[0],) )  # Essentially my start token
+    y = tf.strings.reduce_join([y_padding, y], axis=0)
     
     final_boundary = tf.broadcast_to(" ", (tf.shape(x)[0],) )
-    x = tf.strings.reduce_join([x, final_boundary], axis=0)
     y = tf.strings.reduce_join([y, final_boundary], axis=0)
     
     chars = tf.strings.unicode_split(y, "UTF-8")
@@ -164,8 +164,9 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
 
 train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 test_ds = test.batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
+# train_dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
+# test_dist_dataset = strategy.experimental_distribute_dataset(test_dataset)
 
-# tf.print("Average usage of MAX_CHARS", avg/tf.cast(i, avg.dtype))
 if DEBUG:
     logger.debug("Generating pipepline label stats")
     def label_stats(inputs, labels):
@@ -225,8 +226,8 @@ def get_with_spaces(inputs, labels):
 
 if RUN_AS_SCRIPT:
     if DEBUG:
-        inputs = train_ds.take(10).map(get_without_spaces)
-        outputs = train_ds.take(10).map(get_with_spaces)
+        inputs = train_ds.take(200).map(get_without_spaces)
+        outputs = train_ds.take(200).map(get_with_spaces)
         encoder_tokenizer.adapt(inputs)
         decoder_tokenizer.adapt(outputs)
     else:
@@ -722,7 +723,7 @@ class DecoderLayer(tf.keras.layers.Layer):
         ffn_output = self.dropout1(ffn_output, training=training)
         out3 = self.layernorm3(ffn_output + out2)  # Shape `(batch_size, target_seq_len, d_model)`.
 
-        return out3, attn_weights_masked, attn_weights_cross
+        return out3
 
 class Decoder(tf.keras.layers.Layer):
     def __init__(self,
@@ -756,22 +757,18 @@ class Decoder(tf.keras.layers.Layer):
 #         x = self.tokenizer(x)
 #         return self.pos_embedding.compute_mask(x, previous_mask)
     
-    def call(self, x, enc_output, enc_mask, training):
-        attention_weights = {}
-        x = self.tokenizer(x)
+    def call(self, dec_input, enc_output, enc_mask, training):
+        x = self.tokenizer(dec_input)
         mask = self.pos_embedding.compute_mask(x)
         x = self.pos_embedding(x)  # Shape: `(batch_size, target_seq_len, d_model)`.
 
         x = self.dropout(x, training=training)
 
         for i in range(self.num_layers):
-            x, block1, block2  = self.dec_layers[i](x, mask, enc_output, enc_mask, training)
-
-            attention_weights[f'decoder_layer{i+1}_block1'] = block1
-            attention_weights[f'decoder_layer{i+1}_block2'] = block2
+            x  = self.dec_layers[i](x, mask, enc_output, enc_mask, training)
 
         # The shape of x is `(batch_size, target_seq_len, d_model)`.
-        return x, attention_weights
+        return x
 
 
 train_loss = tf.keras.metrics.Mean(name='train_loss')
@@ -834,7 +831,7 @@ class Transformer(tf.keras.Model):
         self.dense = tf.keras.layers.Dense(1, activation="sigmoid")        
         self.final_layer = NoTwoSpaces(classification_threshold)
 
-    def call(self, inputs, training):
+    def call(self, inputs, training=False):
         # Keras models prefer if you pass all your inputs in the first argument.
         to_enc, to_dec = inputs
 
@@ -842,25 +839,59 @@ class Transformer(tf.keras.Model):
         enc_output = self.encoder(to_enc, training)  # `(batch_size, inp_seq_len, d_model)`
         enc_mask = self.encoder.compute_mask(to_enc)
 
-        # The decoder output.
-        dec_output, attention_weights = self.decoder(
-            to_dec, enc_output, enc_mask, training)  # `(batch_size, tar_seq_len, d_model)`
+        if training:
+            # The decoder output.
+            dec_output = self.decoder(
+                to_dec, enc_output, enc_mask, training)  # `(batch_size, tar_seq_len, d_model)`
 
-        # The final linear layer output.
-        final_output = self.dense(dec_output)  # Shape `(batch_size, tar_seq_len, 1)`.
-        no_two_spaces = self.final_layer(final_output)
-        # Return the final output and the attention weights.
-        return final_output, attention_weights
+            # The final linear layer output.
+            final_output = self.dense(dec_output)  # Shape `(batch_size, tar_seq_len, 1)`.
+            # no_two_spaces = self.final_layer(final_output)
 
+            # Return the final output and the attention weights.
+            return final_output
+        else:
+            # Essentially while we still have characters to place spaces 
+            # in we want to predict the decoder output
+            # Starting with just the token '###'
+            # Start simple by doing each element in the batch individually
+            batch_size = tf.shape(to_enc)[0]
+            output = tf.TensorArray(dtype=tf.float32, size=batch_size)
+            for sample_inx in tf.range(batch_size):
+                sample = to_enc[sample_inx:sample_inx+1, ...] # (1, string)
+                chars_seen = 0
+                to_dec = tf.strings.substr(sample, 0, NGRAM + chars_seen) # (1, string)
+                
+                
+                preds = tf.TensorArray(dtype=tf.float32, size=MAX_CHARS-1)
+                step = 0
+                N = tf.strings.length(sample)[0] # Scalar
+                while chars_seen < N and step < (MAX_CHARS - 1):
+                    dec_output = self.decoder(
+                        to_dec, enc_output[sample_inx:sample_inx+1,...], enc_mask[sample_inx:sample_inx+1,...], training
+                    ) # (1, tar_seq_len, d_model)
+                    spaces = self.dense(dec_output) # (1, tar_seq_len, 1)
+                    space = spaces[0, step, 0]
+                    preds = preds.write(step, space)
+                    if  space > CLASS_THRESHOLD:
+                        to_dec = tf.strings.join([to_dec, ' '])
+                    else:
+                        to_dec = tf.strings.join([
+                            to_dec, 
+                            tf.strings.substr(sample, NGRAM + chars_seen, 1)
+                        ])
+                        chars_seen += 1
+                    step += 1
+                output = output.write(sample_inx, preds.stack())
+            return output.stack()
+                
     @tf.function(input_signature=train_step_signature)
     def train_step(self, data):
         inputs, labels = data
-        batch_size = tf.shape(labels)[0]
-        (inp, tar_inp) = inputs
         real, real_mask = get_real(labels)
 
         with tf.GradientTape() as tape:
-            preds, _ = self(inputs, training = True)
+            preds = self(inputs, training = True)
             predicted_mask = used_all_characters_mask(labels, preds)
             loss, loss_dist = loss_function(real, preds, predicted_mask | real_mask)
         
@@ -934,10 +965,11 @@ model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
     save_weights_only=True)
 
 tboard_callback = tf.keras.callbacks.TensorBoard(log_dir = TENSORBOARD_DIR,
-                                                 histogram_freq = 1,
-                                                 profile_batch = '5,10',
+                                                 histogram_freq = 50,
+                                                 profile_batch = '5,50',
                                                  update_freq='batch',
                                                  write_steps_per_second=True,
+                                                 embeddings_freq=50,
                                                 )
 
 
@@ -949,6 +981,11 @@ if len(list(pathlib.Path(CHECKPOINT_DIR).glob("*"))) > 0:
 callbacks=[model_checkpoint_callback,]
 if DEBUG:
     callbacks.append(tboard_callback)
+
+for x in test_ds.take(1):
+    tf.print(transformer(x[0], training=False))
+
+raise ValueError()
 
 if RUN_AS_SCRIPT:
     logger.info("Compiling model")
