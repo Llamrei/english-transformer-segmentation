@@ -11,6 +11,7 @@
 # Also: think about how to create dataset for Kevin's version
 # Also: rewrite a token accuracy metric that corresponds to BIES tagging protocol
 # Think why NoTwoSpaces is so slow
+# Think how to make this script less hacky and more testable
 
 from datetime import datetime
 import logging
@@ -35,11 +36,11 @@ import tensorflow_datasets as tfds
 # Can also probably speed up metrics through use of tensorarrays instead of ragged tensors.
 # Proper Hyper param opt and experiment tracking
 # More precisely accurate loss using backend.binary_crossentropy
+# Can split data on punctuation to guarantee spaces and make sequences shorter.
 
 TODAY = datetime.today().strftime('%Y-%m-%d %H-%M')
 TENSORBOARD_DIR = './tensorboard/'
 CHECKPOINT_DIR = './checkpoint/'
-
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -52,7 +53,7 @@ file_output.setLevel(logging.DEBUG)
 file_output.setFormatter(formatter)
 logger.addHandler(file_output)
 
-DEBUG = True
+DEBUG = False
 NEGATIVE_CONTROL = False
 
 logger.info(f"Eager: {tf.executing_eagerly()}")
@@ -71,23 +72,23 @@ else:
 JOINING_PUNC = r"([-'`])"
 SPLITTING_PUNC = r'([!"#$%&()\*\+,\./:;<=>?@\[\\\]^_{|}~])'
 NGRAM = 1
-MAX_CHARS = 1000 if not DEBUG else 100
-BATCH_SIZE = 32 if not DEBUG else 2
+MAX_CHARS = 500 if not DEBUG else 100
+BATCH_SIZE = 8 if not DEBUG else 2
 
 # Metric params
 CLASS_THRESHOLD = 0.5
 
 # Model params
-NUM_LAYERS = 4
-D_MODEL = 256
-DFF = 1028
-NUM_ATTENTION_HEADS = 2
-DROPOUT_RATE = 0.3
+NUM_LAYERS = 6 if not DEBUG else 4
+D_MODEL = 512 if not DEBUG else 256
+DFF = 2048 if not DEBUG else 1028
+NUM_ATTENTION_HEADS = 8 if not DEBUG else 2
+DROPOUT_RATE = 0.3 if not DEBUG else 0.1
 
 # Training params
 EPOCHS = 30 if not DEBUG else 300
 STEPS_PER_EPOCH = 100 if not DEBUG else 2
-VALIDATION_STEPS = 50 if not DEBUG else 2
+VALIDATION_STEPS = 5 if not DEBUG else 2
 
 
 visible_devices = tf.config.get_visible_devices('GPU')
@@ -167,10 +168,10 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
 
 train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 test_ds = test.batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
-# train_dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
-# test_dist_dataset = strategy.experimental_distribute_dataset(test_dataset)
+# train_ds = strategy.experimental_distribute_dataset(train_ds)
+# test_ds = strategy.experimental_distribute_dataset(test_ds)
 
-if DEBUG:
+if DEBUG or True:
     logger.debug("Generating pipepline label stats")
     def label_stats(inputs, labels):
         mask = tf.cast(labels != 0, tf.float32)
@@ -240,6 +241,7 @@ if RUN_AS_SCRIPT:
         decoder_tokenizer.adapt(outputs)
 
 # # Metrics and losses
+# with strategy.scope():
 loss_object = tf.keras.losses.BinaryCrossentropy(
     from_logits=False,
     reduction=tf.keras.losses.Reduction.NONE # Need no reduction so we can mask out irrelevant predictions
@@ -311,6 +313,8 @@ def token_accuracy(real_raw, pred):
     accuracies *= mask
     return tf.reduce_mean(tf.reduce_sum(accuracies, axis=-1)/tf.reduce_sum(mask, axis=-1))
 
+# TODO: distribute other metrics correctly later
+
 def sentence_accuracy(labels, pred):
     """
     Takes a batch of labels {0,1,2} and batch of predictions [0,1] and returns whole sentence accuracy across the batch.
@@ -330,7 +334,7 @@ def sentence_accuracy(labels, pred):
     accuracies *= mask
     accuracies += 1 - mask # A bit worried about the double accuracy of this but w/e
     sentence_accuracies = tf.reduce_prod(accuracies, axis=-1)
-    return tf.reduce_mean(sentence_accuracies)
+    return tf.reduce_mean(tf.cast(sentence_accuracies, dtype=tf.float32))
 
 def row_parse_real_word_boundaries(real_row):
     # Given (seq_length,) we want to return a tensor of shape
@@ -542,9 +546,10 @@ class EncoderLayer(tf.keras.layers.Layer):
                d_model, # Input/output dimensionality.
                num_attention_heads,
                dff, # Inner-layer dimensionality.
-               dropout_rate=0.1
+               dropout_rate=0.1,
+               **kwargs
                ):
-        super().__init__()
+        super().__init__(**kwargs)
 
 
         # Multi-head self-attention.
@@ -621,8 +626,9 @@ class Encoder(tf.keras.layers.Layer):
               d_model=d_model,
               num_attention_heads=num_attention_heads,
               dff=dff,
-              dropout_rate=dropout_rate)
-            for _ in range(num_layers)]
+              dropout_rate=dropout_rate,
+              name=f"encoder_sublayer_{i}")
+            for i in range(num_layers)]
         # Dropout.
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
 
@@ -651,9 +657,10 @@ class DecoderLayer(tf.keras.layers.Layer):
                d_model, # Input/output dimensionality.
                num_attention_heads,
                dff, # Inner-layer dimensionality.
-               dropout_rate=0.1
+               dropout_rate=0.1,
+               **kwargs
                ):
-        super().__init__()
+        super().__init__(**kwargs)
 
         # Masked multi-head self-attention.
         self.mha_masked = tf.keras.layers.MultiHeadAttention(
@@ -752,15 +759,11 @@ class Decoder(tf.keras.layers.Layer):
               d_model=d_model,
               num_attention_heads=num_attention_heads,
               dff=dff,
-              dropout_rate=dropout_rate)
-            for _ in range(num_layers)
+              dropout_rate=dropout_rate,
+              name=f"decoder_sublayer_{i}")
+            for i in range(num_layers)
         ]
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
-
-    # Masking.
-#     def compute_mask(self, x, previous_mask=None):
-#         x = self.tokenizer(x)
-#         return self.pos_embedding.compute_mask(x, previous_mask)
     
     def call(self, dec_input, enc_output, enc_mask, training):
         x = self.tokenizer(dec_input)
@@ -1017,7 +1020,7 @@ if not DEBUG and len(list(pathlib.Path(CHECKPOINT_DIR).glob("*"))) > 0:
     transformer.load_weights(CHECKPOINT_DIR)
     logger.info('Latest checkpoint restored!!')
 
-callbacks=[model_checkpoint_callback,]
+callbacks=[model_checkpoint_callback]
 if DEBUG:
     callbacks.append(tboard_callback)
 
