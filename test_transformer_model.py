@@ -1,5 +1,8 @@
 import tensorflow as tf
 
+import os
+import numpy as np
+import random
 import unittest
 
 # Test input pipeline
@@ -9,6 +12,22 @@ from .transformer_segmentation import strip_spaces_and_set_predictions
 from .transformer_segmentation import sentence_accuracy
 from .transformer_segmentation import Transformer
 
+def set_seeds(seed):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    tf.random.set_seed(seed)
+    np.random.seed(seed)
+
+def set_global_determinism(seed):
+    set_seeds(seed=seed)
+
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+    
+    # tf.config.threading.set_inter_op_parallelism_threads(1)
+    # tf.config.threading.set_intra_op_parallelism_threads(1)
+
+set_global_determinism(150797)
 
 class TestInputPipeline(tf.test.TestCase):
     def test_mapping(self):
@@ -195,7 +214,7 @@ class TestMetrics(tf.test.TestCase):
     
 
 class TestInference(tf.test.TestCase):
-    @unittest.skip("Dont want to always run this")
+    # @unittest.skip("Dont want to always run this")
     def setUp(self):
         tf.random.set_seed(150797)
         self.encoder_tokenizer = tf.keras.layers.TextVectorization(
@@ -225,10 +244,9 @@ class TestInference(tf.test.TestCase):
                     "#"*(NGRAM-1)+'what if a word is not long'
                 ])
     
-    @unittest.skip("Dont want to always run this")
+    # @unittest.skip("Dont want to always run this")
     def testForwardPass(self):
         with self.session(use_gpu=False):
-            tf.random.set_seed(150797)
             model = Transformer(
                 num_layers=1,
                 d_model=32,
@@ -239,5 +257,46 @@ class TestInference(tf.test.TestCase):
                 dropout_rate=0.1
             )
             res = model([self.inputs, self.outputs], training=False)
-            tf.print(res, summarize = -1)
-            self.assertEqual(1,1)
+            expected = tf.ragged.constant([
+                [
+                    [0.113609634],
+                    [0.247582987],
+                    [0.295219243],
+                    [0.212690353],
+                    [0.110841691],
+                    [0.0747087225],
+                    [0.075634],
+                    [0.0711343586],
+                    [0.0726035684],
+                    [0.0548635833],
+                    [0.0308177676],
+                    [0.0194270574],
+                    [0.0226549748],
+                    [0.0392052568],
+                    [0.0681078658],
+                    [0.0712439865],
+                    [0.0420827083],
+                ],
+                [
+                    [0.114118628],
+                    [0.247462049],
+                    [0.294691652],
+                    [0.212689832],
+                    [0.111605726],
+                    [0.0749583393],
+                    [0.0758525655],
+                    [0.0720633715],
+                    [0.0740739554],
+                    [0.0557910949],
+                    [0.0308968555],
+                    [0.0191844888],
+                    [0.0224053487],
+                    [0.0397413075],
+                    [0.0703945383],
+                    [0.0736368522],
+                    [0.0432050824],
+                    [0.0272174198],
+                    [0.029272031],
+                    [0.0617184639],
+                ]], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1, 1])
+            self.assertAllClose(res, expected)
