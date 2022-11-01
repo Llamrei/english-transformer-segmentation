@@ -17,7 +17,7 @@ from datetime import datetime
 import logging
 import logging.handlers as handlers
 import pathlib
-import time
+import os
 import sys
 import string
 import html
@@ -53,7 +53,7 @@ file_output.setLevel(logging.DEBUG)
 file_output.setFormatter(formatter)
 logger.addHandler(file_output)
 
-DEBUG = False
+DEBUG = True
 NEGATIVE_CONTROL = False
 
 logger.info(f"Eager: {tf.executing_eagerly()}")
@@ -76,7 +76,7 @@ MAX_CHARS = 500 if not DEBUG else 100
 BATCH_SIZE = 8 if not DEBUG else 2
 
 # Metric params
-CLASS_THRESHOLD = 0.5
+CLASS_THRESHOLD = 0.4
 
 # Model params
 NUM_LAYERS = 6 if not DEBUG else 4
@@ -143,7 +143,6 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
     
     final_boundary = tf.broadcast_to(" ", (tf.shape(x)[0],) )
     y = tf.strings.reduce_join([y, final_boundary], axis=0)
-    
     chars = tf.strings.unicode_split(y, "UTF-8")
     char_ngrams = tf.strings.ngrams(chars, ngram_width=NGRAM, separator="")
     labels = tf.strings.regex_full_match(char_ngrams, ".* ")
@@ -166,12 +165,13 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
         labels = tf.cast(present, labels.dtype)*labels
     return (x, y), labels
 
-train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
-test_ds = test.batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
+if RUN_AS_SCRIPT:
+    train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
+    test_ds = test.shuffle(VALIDATION_STEPS).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
 # train_ds = strategy.experimental_distribute_dataset(train_ds)
 # test_ds = strategy.experimental_distribute_dataset(test_ds)
 
-if DEBUG or True:
+if (DEBUG or True) and RUN_AS_SCRIPT:
     logger.debug("Generating pipepline label stats")
     def label_stats(inputs, labels):
         mask = tf.cast(labels != 0, tf.float32)
@@ -205,23 +205,24 @@ def tokenizer_vocab_size(num_punc):
     if DEBUG:
         return 100
     return (len(string.ascii_lowercase)+num_punc)**NGRAM
-    
-encoder_tokenizer = tf.keras.layers.TextVectorization(
-    standardize="lower", 
-    split="character", 
-    ngrams=(NGRAM,),
-    max_tokens=tokenizer_vocab_size(3), # Want to be able to handle at least #, . and '
-    output_sequence_length=MAX_CHARS-1, # Drop one as we need to account for the fact we predict if a space _follows_
-    output_mode="int"
-    )
-decoder_tokenizer = tf.keras.layers.TextVectorization(
-    standardize="lower", 
-    split="character", 
-    ngrams=(NGRAM,),
-    max_tokens=tokenizer_vocab_size(4), # As above but also with a space
-    output_sequence_length=MAX_CHARS-1,
-    output_mode="int"
-    )
+
+if RUN_AS_SCRIPT:
+    encoder_tokenizer = tf.keras.layers.TextVectorization(
+        standardize="lower", 
+        split="character", 
+        ngrams=(NGRAM,),
+        max_tokens=tokenizer_vocab_size(3), # Want to be able to handle at least #, . and '
+        output_sequence_length=MAX_CHARS-1, # Drop one as we need to account for the fact we predict if a space _follows_
+        output_mode="int"
+        )
+    decoder_tokenizer = tf.keras.layers.TextVectorization(
+        standardize="lower", 
+        split="character", 
+        ngrams=(NGRAM,),
+        max_tokens=tokenizer_vocab_size(4), # As above but also with a space
+        output_sequence_length=MAX_CHARS-1,
+        output_mode="int"
+        )
 def get_without_spaces(inputs, labels):
     return inputs[0]
 def get_with_spaces(inputs, labels):
@@ -332,7 +333,7 @@ def sentence_accuracy(labels, pred):
     accuracies = tf.equal(real, tf.cast(pred > CLASS_THRESHOLD, real.dtype))
     accuracies = tf.cast(accuracies, dtype=mask.dtype)
     accuracies *= mask
-    accuracies += 1 - mask # A bit worried about the double accuracy of this but w/e
+    accuracies += 1 - mask
     sentence_accuracies = tf.reduce_prod(accuracies, axis=-1)
     return tf.reduce_mean(tf.cast(sentence_accuracies, dtype=tf.float32))
 
@@ -863,6 +864,7 @@ class Transformer(tf.keras.Model):
             # in we want to predict the decoder output
             # Starting with just the token '###'
             # Start simple by doing each element in the batch individually
+            logger.debug("Running inference")
             batch_size = tf.shape(to_enc)[0]
             output = tf.TensorArray(dtype=tf.float32, size=batch_size)
             for sample_inx in tf.range(batch_size):
@@ -911,7 +913,8 @@ class Transformer(tf.keras.Model):
         train_loss_high(uq-med)
         train_loss(loss)
         train_token_accuracy(token_accuracy(labels, preds))
-        train_sentence_accuracy(sentence_accuracy(labels, preds))
+        sent_acc = sentence_accuracy(labels, preds)
+        train_sentence_accuracy(sent_acc)
         metrics = {
             'loss': train_loss.result(),
             'median loss': train_loss_med.result(),
@@ -941,6 +944,7 @@ class Transformer(tf.keras.Model):
         train_loss(loss)
         train_token_accuracy(token_accuracy(labels, preds))
         train_sentence_accuracy(sentence_accuracy(labels, preds))
+        
         metrics = {
             'loss': train_loss.result(),
             'median loss': train_loss_med.result(),
@@ -965,15 +969,16 @@ class Transformer(tf.keras.Model):
 # # Model creation + training
 # ## Hyperparams and model instantiation
 logger.info("Creating transformer")
-transformer = Transformer(
-    num_layers=NUM_LAYERS,
-    d_model=D_MODEL,
-    num_attention_heads=NUM_ATTENTION_HEADS,
-    dff=DFF,
-    input_tokenizer=encoder_tokenizer,
-    target_tokenizer=decoder_tokenizer,
-    dropout_rate=DROPOUT_RATE
-    )
+if RUN_AS_SCRIPT:
+    transformer = Transformer(
+        num_layers=NUM_LAYERS,
+        d_model=D_MODEL,
+        num_attention_heads=NUM_ATTENTION_HEADS,
+        dff=DFF,
+        input_tokenizer=encoder_tokenizer,
+        target_tokenizer=decoder_tokenizer,
+        dropout_rate=DROPOUT_RATE
+        )
 
 # ## Training details
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
@@ -1008,7 +1013,7 @@ model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
 
 tboard_callback = tf.keras.callbacks.TensorBoard(log_dir = TENSORBOARD_DIR,
                                                 #  histogram_freq = 50,
-                                                 profile_batch = '75,125',
+                                                 profile_batch = '95,105',
                                                  update_freq='batch',
                                                  write_steps_per_second=True,
                                                  embeddings_freq=50,
@@ -1020,9 +1025,7 @@ if not DEBUG and len(list(pathlib.Path(CHECKPOINT_DIR).glob("*"))) > 0:
     transformer.load_weights(CHECKPOINT_DIR)
     logger.info('Latest checkpoint restored!!')
 
-callbacks=[model_checkpoint_callback]
-if DEBUG:
-    callbacks.append(tboard_callback)
+callbacks=[model_checkpoint_callback, tboard_callback]
 
 if RUN_AS_SCRIPT:
     logger.info("Compiling model")
