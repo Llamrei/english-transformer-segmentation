@@ -29,6 +29,10 @@ import tensorflow as tf # v2.10
 import tensorflow_probability as tfp
 import tensorflow_datasets as tfds
 
+RUN_AS_SCRIPT = False
+if __name__ == "__main__":
+    RUN_AS_SCRIPT = True
+
 # TODO:
 # Lot of scope for optimisation of data types as we dont need more than int8 or something to store 1s/0s
 # Also could improve through use of gather to make the where code more streamlined
@@ -48,10 +52,13 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 stderr = logging.StreamHandler()
 stderr.setLevel(logging.INFO)
 stderr.setFormatter(formatter)
-file_output = handlers.RotatingFileHandler(f'{TODAY}.log', maxBytes=10000, backupCount=1)
-file_output.setLevel(logging.DEBUG)
-file_output.setFormatter(formatter)
-logger.addHandler(file_output)
+logger.addHandler(stderr)
+
+if RUN_AS_SCRIPT:
+    file_output = handlers.RotatingFileHandler(f'{TODAY}.log', maxBytes=10000, backupCount=1)
+    file_output.setLevel(logging.DEBUG)
+    file_output.setFormatter(formatter)
+    logger.addHandler(file_output)
 
 DEBUG = True
 NEGATIVE_CONTROL = False
@@ -59,24 +66,22 @@ NEGATIVE_CONTROL = False
 logger.info(f"Eager: {tf.executing_eagerly()}")
 
 # Running params
-if __name__ == "__main__":
-    RUN_AS_SCRIPT = True
+if RUN_AS_SCRIPT:
     GPU_FROM = int(sys.argv[1])
     GPU_TO = int(sys.argv[2])
 else:
-    RUN_AS_SCRIPT = False
     GPU_FROM = 0
     GPU_TO = 0
 
 # Data definition params 
 JOINING_PUNC = r"([-'`])"
 SPLITTING_PUNC = r'([!"#$%&()\*\+,\./:;<=>?@\[\\\]^_{|}~])'
-NGRAM = 1
+NGRAM = 3 if not DEBUG else 1
 MAX_CHARS = 500 if not DEBUG else 100
 BATCH_SIZE = 8 if not DEBUG else 2
 
 # Metric params
-CLASS_THRESHOLD = 0.4
+CLASS_THRESHOLD = 0.3
 
 # Model params
 NUM_LAYERS = 6 if not DEBUG else 4
@@ -86,7 +91,7 @@ NUM_ATTENTION_HEADS = 8 if not DEBUG else 2
 DROPOUT_RATE = 0.3 if not DEBUG else 0.1
 
 # Training params
-EPOCHS = 30 if not DEBUG else 300
+EPOCHS = 300 if not DEBUG else 30
 STEPS_PER_EPOCH = 100 if not DEBUG else 2
 VALIDATION_STEPS = 5 if not DEBUG else 2
 
@@ -135,21 +140,39 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
     x = tf.strings.regex_replace(x, SPLITTING_PUNC, r"\1 ")   # \1 inserts captured splitting punctuation, raw so python doesnt magic it
     x = tf.strings.split(x)
     no_whitespace_list = tf.strings.strip(x) # Remove any excess whitespace, e.g. tabs, double spaces etc.
+    word_lengths = tf.strings.length(no_whitespace_list)
+    def mark_spaces(row_of_word_lengths):
+        
+        def all_zeros_except_last_letter(word_length):
+            a = tf.zeros((word_length), dtype=tf.float32)
+            a = tf.concat([a[:-1],[1.]], axis=-1)
+            return a
+        
+        binary_chars = tf.map_fn(
+            fn=all_zeros_except_last_letter,
+            elems=row_of_word_lengths,
+            fn_output_signature = tf.RaggedTensorSpec([None], dtype=tf.float32)
+        )
+        binary_chars = binary_chars.merge_dims(0, 1)
+        return binary_chars
+        
+    y = tf.map_fn(
+        fn=mark_spaces,
+        elems=word_lengths,
+        fn_output_signature = tf.RaggedTensorSpec([None])
+    )
+    
+    y_start = tf.broadcast_to(1., (tf.shape(y)[0],1) )  # Essentially start token
+    y = tf.concat([y_start, y], axis=-1)
+
     x = tf.strings.reduce_join(no_whitespace_list, separator="", axis=-1)
-    y = tf.strings.reduce_join(no_whitespace_list, separator=" ", axis=-1)
-    
-    y_padding = tf.broadcast_to("#"*(NGRAM-1), (tf.shape(x)[0],) )  # Essentially my start token
-    y = tf.strings.reduce_join([y_padding, y], axis=0)
-    
-    final_boundary = tf.broadcast_to(" ", (tf.shape(x)[0],) )
-    y = tf.strings.reduce_join([y, final_boundary], axis=0)
-    chars = tf.strings.unicode_split(y, "UTF-8")
-    char_ngrams = tf.strings.ngrams(chars, ngram_width=NGRAM, separator="")
-    labels = tf.strings.regex_full_match(char_ngrams, ".* ")
-    labels = tf.cast(labels, tf.int64)+1 # Add 1 to be able to tell difference between padding and prediction
-    labels = labels.to_tensor(default_value=0, shape=[None, MAX_CHARS])
+    x_start = tf.broadcast_to("#"*(NGRAM-1), (tf.shape(x)[0],) )  # Essentially start token
+    x = tf.strings.reduce_join([x_start, x], axis=0)
+
+    y = y + 1 # Add 1 to tell difference between labels and missing
+    y = y.to_tensor(default_value=0, shape=[None, MAX_CHARS])
     # Roll so we predict for _future_ spaces not spaces in current token (if we knew space in current token we wouldnt have anything to solve)
-    labels = tf.roll(labels, shift=-1, axis=-1)
+    labels = tf.roll(y, shift=-1, axis=-1)
     labels = labels[:,:-1]
 
     # Negative controls
@@ -163,7 +186,7 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
         labels = tf.random.stateless_binomial(shape=tf.shape(labels), seed=[1507, 1997], counts=1, probs=0.5) + 1
         labels = tf.cast(labels, tf.int64)
         labels = tf.cast(present, labels.dtype)*labels
-    return (x, y), labels
+    return (x, y[:,:-1]), labels
 
 if RUN_AS_SCRIPT:
     train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
@@ -171,6 +194,7 @@ if RUN_AS_SCRIPT:
 # train_ds = strategy.experimental_distribute_dataset(train_ds)
 # test_ds = strategy.experimental_distribute_dataset(test_ds)
 
+# TODO: Once we're not always debugging remove this weird condition
 if (DEBUG or True) and RUN_AS_SCRIPT:
     logger.debug("Generating pipepline label stats")
     def label_stats(inputs, labels):
@@ -196,6 +220,8 @@ if (DEBUG or True) and RUN_AS_SCRIPT:
     avg_no_spaces /= i
     logger.debug(f"Avg char_usage {avg_char_usage}")
     logger.debug(f"Avg no spaces {avg_no_spaces}")
+    for data in train_ds.take(1):
+        inputs, outputs = data
 
 
 logger.info("Training tokenizers")
@@ -215,14 +241,14 @@ if RUN_AS_SCRIPT:
         output_sequence_length=MAX_CHARS-1, # Drop one as we need to account for the fact we predict if a space _follows_
         output_mode="int"
         )
-    decoder_tokenizer = tf.keras.layers.TextVectorization(
-        standardize="lower", 
-        split="character", 
-        ngrams=(NGRAM,),
-        max_tokens=tokenizer_vocab_size(4), # As above but also with a space
-        output_sequence_length=MAX_CHARS-1,
-        output_mode="int"
-        )
+    # decoder_tokenizer = tf.keras.layers.TextVectorization(
+    #     standardize="lower", 
+    #     split="character", 
+    #     ngrams=(NGRAM,),
+    #     max_tokens=tokenizer_vocab_size(4), # As above but also with a space
+    #     output_sequence_length=MAX_CHARS-1,
+    #     output_mode="int"
+    #     )
 def get_without_spaces(inputs, labels):
     return inputs[0]
 def get_with_spaces(inputs, labels):
@@ -232,14 +258,14 @@ def get_with_spaces(inputs, labels):
 if RUN_AS_SCRIPT:
     if DEBUG:
         inputs = train_ds.take(200).map(get_without_spaces)
-        outputs = train_ds.take(200).map(get_with_spaces)
+        # outputs = train_ds.take(200).map(get_with_spaces)
         encoder_tokenizer.adapt(inputs)
-        decoder_tokenizer.adapt(outputs)
+        # decoder_tokenizer.adapt(outputs)
     else:
         inputs = train_ds.map(get_without_spaces)
-        outputs = train_ds.map(get_with_spaces)
+        # outputs = train_ds.map(get_with_spaces)
         encoder_tokenizer.adapt(inputs)
-        decoder_tokenizer.adapt(outputs)
+        # decoder_tokenizer.adapt(outputs)
 
 # # Metrics and losses
 # with strategy.scope():
@@ -303,18 +329,54 @@ def token_accuracy(real_raw, pred):
     that represent usage of all of the letters. We choose whichever is longer.
     """
     real, real_mask = get_real(real_raw)
-    predicted_mask = used_all_characters_mask(real_raw, pred)
-    mask = tf.cast(predicted_mask | real_mask, real.dtype)
-    # tf.print(real_raw, real, pred, mask, summarize=-1)
+    real = tf.cast(real, tf.int16)
+    mask = tf.cast(real_mask, tf.int16)
     if tf.shape(pred)[-1] == 1:
         pred = tf.squeeze(pred, axis=-1)
     pred *= tf.cast(mask, pred.dtype)
-    accuracies = tf.equal(real, tf.cast( pred > CLASS_THRESHOLD, real.dtype))
+    accuracies = tf.equal(real, tf.cast( pred > CLASS_THRESHOLD, tf.int16))
     accuracies = tf.cast(accuracies, dtype=mask.dtype)
     accuracies *= mask
     return tf.reduce_mean(tf.reduce_sum(accuracies, axis=-1)/tf.reduce_sum(mask, axis=-1))
 
-# TODO: distribute other metrics correctly later
+def word_accuracy(labels, pred):
+    pass
+
+def sparse_remove(sparse_tensor, remove_value=0.):
+  return tf.sparse.retain(sparse_tensor, tf.not_equal(sparse_tensor.values, remove_value))
+
+def precision_and_recall(real_raw, pred): 
+    # TODO: rewrite this to be correct and masked
+    """
+    Given where we guessed spaces to be (batch of predictions in [0,1]) - what fraction are actually spaces
+    in the original label (batch of truths {0,1,2} - 0 being padding, 1 being character, 2 being space)
+
+    returns TensorShape(batch,precision), TensorShape(batch,recall) tuple
+    """
+    real, real_mask = get_real(real_raw)
+    if tf.shape(pred)[-1] == 1:
+        pred = tf.squeeze(pred, axis=-1)
+    real = tf.cast(real, tf.int16) # batch, seq_len
+    spaces = tf.cast(pred > CLASS_THRESHOLD, tf.int16) # batch, seq_len
+    correct_pos = tf.reduce_sum(tf.cast((tf.equal(real, spaces) & tf.equal(real, 1)) , tf.float32), axis=-1)
+
+    real_mask = tf.cast(real_mask, spaces.dtype)
+    pred_pos = tf.cast(tf.reduce_sum(spaces*real_mask, axis=-1), tf.float32)
+    true_pos = tf.cast(tf.reduce_sum(real, axis=-1), tf.float32)
+    
+    if DEBUG:
+        tf.print(
+        "Inside precision/recall function", 
+        "\n Label\n", real_raw,
+        "\n Label postprocess\n", real, 
+        "\n Pred\n", spaces,
+        "\n Mask\n", real_mask,
+        "\n Correct\n", correct_pos, 
+        "\n Num predicted\n", pred_pos, 
+        "\n Num actually\n", true_pos,
+        summarize=-1
+        )
+    return tf.math.divide_no_nan(correct_pos,pred_pos), tf.math.divide_no_nan(correct_pos,true_pos)
 
 def sentence_accuracy(labels, pred):
     """
@@ -461,7 +523,7 @@ def classify_errors(real, pred):
 class VotingExpertsMetric(tf.keras.metrics.Metric):
     def __init__(self, name="voting_experts", **kwargs):
         super().__init__(name=name, **kwargs)
-        self.error_types = self.add_weight(name="error_types", shape=(6,))
+        self.error_types = self.add_weight(name="error_types", shape=(6,), initializer="zeros")
 
     def update_state(self, real, pred):
         errors = classify_errors(real, pred)
@@ -478,6 +540,28 @@ class VotingExpertsMetric(tf.keras.metrics.Metric):
             'totally-wrong': normalized[5]
         }
 
+class PrecisionRecall(tf.keras.metrics.Metric):
+    def __init__(self, name="precision_recall", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.i = self.add_weight(name="iteration", initializer="zeros")
+        self.precision = self.add_weight(name="precision", initializer="zeros")
+        self.recall = self.add_weight(name="recall", initializer="zeros")
+        self.f1 = self.add_weight(name="f1", initializer="zeros")
+
+    def update_state(self, real, pred):
+        precision, recall = precision_and_recall(real, pred)
+        f1 = 2*tf.math.divide_no_nan(precision*recall,(precision+recall))
+        self.i.assign_add(1.)
+        self.precision.assign_add(tf.reduce_mean(precision))
+        self.recall.assign_add(tf.reduce_mean(recall))
+        self.f1.assign_add(tf.reduce_mean(f1))
+
+    def result(self):
+        return {
+            'precision': self.precision/self.i,
+            'recall': self.recall/self.i,
+            'f1': self.f1/self.i,
+        }
 # # Embedding defn
 def positional_encoding(length, depth):
     depth = depth/2
@@ -745,15 +829,13 @@ class Decoder(tf.keras.layers.Layer):
                d_model, # Input/output dimensionality.
                num_attention_heads,
                dff, # Inner-layer dimensionality.
-               tokenizer,
                dropout_rate=0.1
                ):
         super().__init__()
 
         self.d_model = d_model
         self.num_layers = num_layers
-        self.tokenizer = tokenizer
-        self.pos_embedding = PositionalEmbedding(tokenizer.vocabulary_size(), d_model)
+        self.pos_embedding = PositionalEmbedding(3, d_model)
 
         self.dec_layers = [
             DecoderLayer(
@@ -767,9 +849,8 @@ class Decoder(tf.keras.layers.Layer):
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
     
     def call(self, dec_input, enc_output, enc_mask, training):
-        x = self.tokenizer(dec_input)
-        mask = self.pos_embedding.compute_mask(x)
-        x = self.pos_embedding(x)  # Shape: `(batch_size, target_seq_len, d_model)`.
+        mask = self.pos_embedding.compute_mask(dec_input)
+        x = self.pos_embedding(dec_input)  # Shape: `(batch_size, target_seq_len, d_model)`.
 
         x = self.dropout(x, training=training)
 
@@ -789,14 +870,15 @@ train_token_accuracy = tf.keras.metrics.Mean(name='train_token_accuracy')
 train_sentence_accuracy = tf.keras.metrics.Mean(name='train_token_accuracy')
 train_AUC = tf.keras.metrics.AUC(name="train_AUC", from_logits=False)
 train_Voting_Experts = VotingExpertsMetric()
+train_prf = PrecisionRecall()
 
 train_step_signature = [
     (
         (
             tf.TensorSpec(shape=(None, ), dtype=tf.string),
-            tf.TensorSpec(shape=(None, ), dtype=tf.string)
+            tf.TensorSpec(shape=(None, MAX_CHARS-1), dtype=tf.float32)
         ),
-        tf.TensorSpec(shape=(None, MAX_CHARS-1), dtype=tf.int64),
+        tf.TensorSpec(shape=(None, MAX_CHARS-1), dtype=tf.float32),
     )
 ]
 train_writer = tf.summary.create_file_writer(TENSORBOARD_DIR + "train/")
@@ -811,7 +893,6 @@ class Transformer(tf.keras.Model):
                num_attention_heads,
                dff, # Inner-layer dimensionality.
                input_tokenizer,
-               target_tokenizer,
                dropout_rate=0.1,
                classification_threshold=0.5
                ):
@@ -832,7 +913,6 @@ class Transformer(tf.keras.Model):
           d_model=d_model,
           num_attention_heads=num_attention_heads,
           dff=dff,
-          tokenizer=target_tokenizer,
           dropout_rate=dropout_rate
           )
 
@@ -866,34 +946,21 @@ class Transformer(tf.keras.Model):
             # Start simple by doing each element in the batch individually
             logger.debug("Running inference")
             batch_size = tf.shape(to_enc)[0]
-            output = tf.TensorArray(dtype=tf.float32, size=batch_size)
-            for sample_inx in tf.range(batch_size):
-                sample = to_enc[sample_inx:sample_inx+1, ...] # (1, string)
-                chars_seen = 0
-                to_dec = tf.strings.substr(sample, 0, NGRAM + chars_seen) # (1, string)
-                
-                
-                preds = tf.TensorArray(dtype=tf.float32, size=MAX_CHARS-1)
-                step = 0
-                N = tf.strings.length(sample)[0] # Scalar
-                while chars_seen < N and step < (MAX_CHARS - 1):
-                    dec_output = self.decoder(
-                        to_dec, enc_output[sample_inx:sample_inx+1,...], enc_mask[sample_inx:sample_inx+1,...], training
-                    ) # (1, tar_seq_len, d_model)
-                    spaces = self.dense(dec_output) # (1, tar_seq_len, 1)
-                    space = spaces[0, step, 0]
-                    preds = preds.write(step, space)
-                    if  space > CLASS_THRESHOLD:
-                        to_dec = tf.strings.join([to_dec, ' '])
-                    else:
-                        to_dec = tf.strings.join([
-                            to_dec, 
-                            tf.strings.substr(sample, NGRAM + chars_seen, 1)
-                        ])
-                        chars_seen += 1
-                    step += 1
-                output = output.write(sample_inx, preds.stack())
-            return output.stack()[..., tf.newaxis]
+            start = tf.broadcast_to(1., (batch_size,))
+            output_array = tf.TensorArray(dtype=tf.float32, size=MAX_CHARS-1, dynamic_size=False)
+            output_array = output_array.write(0, start)
+            for char_inx in tf.range(1,MAX_CHARS-1):
+                to_dec = tf.transpose(output_array.stack())
+                # tf.autograph.experimental.set_loop_options(
+                #     shape_invariants=[(to_dec, tf.TensorShape([None, None]))]
+                # )
+                dec_output = self.decoder(
+                    to_dec, enc_output, enc_mask, training=False
+                ) # (batch, tar_seq_len, d_model)
+                final_output = self.dense(dec_output) # (batch, tar_seq_len, 1)
+                new_token = tf.squeeze(final_output)[:,char_inx] # (batch, )
+                output_array = output_array.write(char_inx, new_token)
+            return tf.transpose(output_array.stack())[..., tf.newaxis]
                 
     @tf.function(input_signature=train_step_signature)
     def train_step(self, data):
@@ -902,8 +969,7 @@ class Transformer(tf.keras.Model):
 
         with tf.GradientTape() as tape:
             preds = self(inputs, training = True)
-            predicted_mask = used_all_characters_mask(labels, preds)
-            loss, loss_dist = loss_function(real, preds, predicted_mask | real_mask)
+            loss, loss_dist = loss_function(real, preds, real_mask)
         
         gradients = tape.gradient(loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
@@ -915,13 +981,15 @@ class Transformer(tf.keras.Model):
         train_token_accuracy(token_accuracy(labels, preds))
         sent_acc = sentence_accuracy(labels, preds)
         train_sentence_accuracy(sent_acc)
+        train_prf.update_state(labels, preds)
         metrics = {
             'loss': train_loss.result(),
-            'median loss': train_loss_med.result(),
-            'bottom decile delta': train_loss_low.result(),
-            'top decile delta': train_loss_high.result(),
+            # 'median loss': train_loss_med.result(),
+            # 'bottom decile delta': train_loss_low.result(),
+            # 'top decile delta': train_loss_high.result(),
             'token accuracy': train_token_accuracy.result(),
             'sentence accuracy': train_sentence_accuracy.result(),
+            **train_prf.result()
         }
         with train_writer.as_default(step=self._train_counter):
             for k, v in metrics.items():
@@ -934,8 +1002,7 @@ class Transformer(tf.keras.Model):
         real, real_mask = get_real(labels)
 
         preds = self(inputs, training = False)
-        predicted_mask = used_all_characters_mask(labels, preds)
-        loss, loss_dist = loss_function(real, preds, predicted_mask | real_mask)
+        loss, loss_dist = loss_function(real, preds, real_mask)
         
         lq, med, uq = tfp.stats.percentile(loss_dist, 10), tfp.stats.percentile(loss_dist, 50), tfp.stats.percentile(loss_dist, 90)
         train_loss_low(med-lq)
@@ -944,23 +1011,26 @@ class Transformer(tf.keras.Model):
         train_loss(loss)
         train_token_accuracy(token_accuracy(labels, preds))
         train_sentence_accuracy(sentence_accuracy(labels, preds))
-        
+        train_prf.update_state(labels, preds)
+        # train_Voting_Experts(labels, preds) TODO: Fix this metric - is now complaining about graph access :cry:
         metrics = {
             'loss': train_loss.result(),
-            'median loss': train_loss_med.result(),
-            'bottom decile delta': train_loss_low.result(),
-            'top decile delta': train_loss_high.result(),
+            # 'median loss': train_loss_med.result(),
+            # 'bottom decile delta': train_loss_low.result(),
+            # 'top decile delta': train_loss_high.result(),
             'token accuracy': train_token_accuracy.result(),
             'sentence accuracy': train_sentence_accuracy.result(),
+            **train_prf.result(),
+            # **train_Voting_Experts.result(),
         }
         with train_writer.as_default(step=self._train_counter):
             for k, v in metrics.items():
                 tf.summary.scalar(k, v)
         return metrics
     
-    @property
-    def metrics(self):
-        return [train_loss, train_loss_med, train_loss_low, train_loss_high, train_token_accuracy, train_sentence_accuracy]
+    # @property
+    # def metrics(self):
+    #     return [train_loss, train_loss_med, train_loss_low, train_loss_high, train_token_accuracy, train_sentence_accuracy]
 
     
     
@@ -976,7 +1046,6 @@ if RUN_AS_SCRIPT:
         num_attention_heads=NUM_ATTENTION_HEADS,
         dff=DFF,
         input_tokenizer=encoder_tokenizer,
-        target_tokenizer=decoder_tokenizer,
         dropout_rate=DROPOUT_RATE
         )
 
@@ -995,7 +1064,7 @@ class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
         arg1 = tf.math.rsqrt(step)
         arg2 = step * (self.warmup_steps ** -1.5)
 
-        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+        return 2* tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
 
 learning_rate = CustomSchedule(D_MODEL)
 
@@ -1021,7 +1090,7 @@ tboard_callback = tf.keras.callbacks.TensorBoard(log_dir = TENSORBOARD_DIR,
 
 
 # If a checkpoint exists, restore the latest checkpoint.
-if not DEBUG and len(list(pathlib.Path(CHECKPOINT_DIR).glob("*"))) > 0:
+if not DEBUG and len(list(pathlib.Path(CHECKPOINT_DIR).glob("*"))) > 0 and RUN_AS_SCRIPT:
     transformer.load_weights(CHECKPOINT_DIR)
     logger.info('Latest checkpoint restored!!')
 
