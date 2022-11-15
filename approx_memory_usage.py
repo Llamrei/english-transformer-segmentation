@@ -40,11 +40,11 @@ decoder = NUM_LAYERS*decoder_layer
 total_mem = simply_data+encoder+decoder
 
 print(
-f"Input: {simply_data*precision/gigabyte_conversion:.2f} ({simply_data/total_mem:.2f})"
-f"Single attention mechanism: {attention_mechanism*precision/gigabyte_conversion:.2f} ({attention_mechanism/total_mem:.2f})"\
-f"Encoder layer: {encoder_layer*precision/gigabyte_conversion:.2f} ({encoder_layer/total_mem:.2f})"
-f"Decoder layer: {decoder_layer*precision/gigabyte_conversion:.2f} ({decoder_layer/total_mem:.2f})"
-f"Encoder overall: {encoder*precision/gigabyte_conversion:.2f} ({encoder/total_mem:.2f})"
-f"Decoder overall: {decoder*precision/gigabyte_conversion:.2f} ({decoder/total_mem:.2f})"
-f"Overall : {total_mem*precision/gigabyte_conversion:.2f}"
+f"Input embedded: {simply_data*precision/gigabyte_conversion:.2f}GB ({simply_data/total_mem:.2f})\n"
+f"Single attention mechanism: {attention_mechanism*precision/gigabyte_conversion:.2f}GB ({attention_mechanism/total_mem:.2f})\n"
+f"Encoder layer: {encoder_layer*precision/gigabyte_conversion:.2f}GB ({encoder_layer/total_mem:.2f})\n"
+f"Decoder layer: {decoder_layer*precision/gigabyte_conversion:.2f}GB ({decoder_layer/total_mem:.2f})\n"
+f"Encoder overall: {encoder*precision/gigabyte_conversion:.2f}GB ({encoder/total_mem:.2f})\n"
+f"Decoder overall: {decoder*precision/gigabyte_conversion:.2f}GB ({decoder/total_mem:.2f})\n"
+f"Overall : {total_mem*precision/gigabyte_conversion:.2f}GB\n"
 )
