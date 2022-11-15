@@ -10,6 +10,7 @@ from .transformer_segmentation import NGRAM
 from .transformer_segmentation import MAX_CHARS
 from .transformer_segmentation import strip_spaces_and_set_predictions
 from .transformer_segmentation import sentence_accuracy
+from .transformer_segmentation import precision_and_recall
 from .transformer_segmentation import Transformer
 
 def set_seeds(seed):
@@ -107,7 +108,6 @@ class TestInputPipeline(tf.test.TestCase):
             with self.subTest("Decoder input correct"):
                 self.assertAllEqual(expected_output[0][1], res[0][1])
 
-
 class TestMetrics(tf.test.TestCase):
     def test_sentence_accuracy(self):
         mappings = [
@@ -159,6 +159,121 @@ class TestMetrics(tf.test.TestCase):
             labels, preds = _input
             res = sentence_accuracy(labels, preds)
             self.assertAllEqual(expected_output, res)
+
+    def test_precision_recall(self):
+        mappings = [
+            (
+                (
+                    tf.ragged.constant([
+                        [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2],
+                        [1, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 2]
+                    ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                    tf.ragged.constant([
+                        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+                        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                )
+                ,
+                (
+                    # All predicted positives are real positives in both cases - precision fine
+                    tf.constant([
+                        6/6,
+                        2/2,
+                    ]),
+                    # First row has all real positives recalled, but second only has 2 out of 7
+                    tf.constant([
+                        6/6,
+                        2/7,
+                    ]),
+                ),
+                "Good precision, bad recall"
+                
+            ),
+            (
+                (
+                    tf.ragged.constant([
+                        [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2],
+                        [1, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 2]
+                    ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                    tf.ragged.constant([
+                        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+                        [0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                )
+                ,
+                (
+                    # All predicted positives are real positives in both cases
+                    tf.constant([
+                        6/6,
+                        7/7,
+                    ]),
+                    # All real values recalled
+                    tf.constant([
+                        6/6,
+                        7/7,
+                    ]),
+                ),
+                "Good overall"
+            ),
+            (
+                (
+                    tf.ragged.constant([
+                        [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2],
+                        [1, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 2]
+                    ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                    tf.ragged.constant([
+                        [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1],
+                        [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                )
+                ,
+                (
+                    # Both cases have multiple predicted value that is not a true positive
+                    tf.constant([
+                        1/4,
+                        1/3
+                    ]),
+                    tf.constant([
+                        1/6,
+                        1/7
+                    ]),
+                ),
+                "Both poor"
+            ),
+            (
+                (
+                    tf.ragged.constant([
+                        [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2],
+                        [1, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 2]
+                    ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                    tf.ragged.constant([
+                        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1],
+                        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                )
+                ,
+                (
+                    # Both cases have multiple predicted value that is not a true positive
+                    tf.constant([
+                        1/4,
+                        1/3
+                    ]),
+                    tf.constant([
+                        1/6,
+                        1/7
+                    ]),
+                ),
+                "Both poor - preds starting with space"
+            ),
+        ]
+
+        for _input, expected_output, msg in mappings:
+            labels, preds = _input
+            pres, reca = precision_and_recall(labels, preds)
+            with self.subTest("Precision: "+msg):
+                self.assertAllClose(expected_output[0], pres, msg="Precision")
+            with self.subTest("Recall: "+msg):
+                self.assertAllClose(expected_output[1], reca)
 
     def test_sentence_accuracy_metric(self):
         mappings = [
@@ -214,7 +329,7 @@ class TestMetrics(tf.test.TestCase):
     
 
 class TestInference(tf.test.TestCase):
-    # @unittest.skip("Dont want to always run this")
+    @unittest.skip("Dont want to always run this")
     def setUp(self):
         tf.random.set_seed(150797)
         self.encoder_tokenizer = tf.keras.layers.TextVectorization(
