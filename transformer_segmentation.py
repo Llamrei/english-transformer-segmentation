@@ -266,6 +266,7 @@ if RUN_AS_SCRIPT:
         # outputs = train_ds.map(get_with_spaces)
         encoder_tokenizer.adapt(inputs)
         logger.debug("Tokenizer config", encoder_tokenizer.get_config())
+        encoder_tokenizer.save_weights('tokenizer_weights')
         with open("tokenizer_config", "w") as f:
             json.dump(encoder_tokenizer.get_config(), f)
         # decoder_tokenizer.adapt(outputs)
@@ -314,15 +315,16 @@ def used_all_characters_mask(real_raw, pred):
 
 def loss_function(real, pred, mask):
     """
-    Takes a batch of {0,1} labels (e.g. need to preprocess labels), [0,1] predictions and a boolean mask for computing loss.
-
+    Takes a batch of {0,1} labels (e.g. need to preprocess labels before passing), [0,1] predictions and a boolean mask for computing loss.
+    1 indicates space
     Also returns a distribution of the loss across the batch.
     """
     if tf.shape(pred)[-1] == 1:
         pred = tf.squeeze(pred, axis=-1)
     pred *= tf.cast(mask, dtype=pred.dtype)
     loss_object.reduction = tf.losses.Reduction.NONE # Make loss not reduce so we can sample dist of loss
-    loss_ = loss_object(real, pred) # batch,1
+    weights = real/0.2 + (1-real)/0.8
+    loss_ = loss_object(real, pred, sample_weight=weights) # batch,1
     # Dont divide by tf.cast(tf.reduce_sum(mask), dtype=loss_.dtype) 
     # as we hope that the masked (0 + eps) output matching the real 0 is good enough to not fit to masked data
     return tf.reduce_mean(loss_), loss_
@@ -1059,12 +1061,6 @@ if RUN_AS_SCRIPT:
         )
 
 # ## Training details
-class SaveTokenizer(tf.keras.callbacks.Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        self.tokenizer.save_weights(CHECKPOINT_DIR+'tokenizer_weights')
-        with open(CHECKPOINT_DIR+'tokenizer_weights', 'w') as f:
-            json.dump(self.tokenizer.get_config(), f)
-
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, d_model, warmup_steps=200):
         super().__init__()
