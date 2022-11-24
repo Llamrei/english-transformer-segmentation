@@ -17,7 +17,7 @@ from datetime import datetime
 import logging
 import logging.handlers as handlers
 import pathlib
-import os
+import json
 import sys
 import string
 import html
@@ -60,7 +60,7 @@ if RUN_AS_SCRIPT:
     file_output.setFormatter(formatter)
     logger.addHandler(file_output)
 
-DEBUG = True
+DEBUG = False
 NEGATIVE_CONTROL = False
 
 logger.info(f"Eager: {tf.executing_eagerly()}")
@@ -166,7 +166,7 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
     y = tf.concat([y_start, y], axis=-1)
 
     x = tf.strings.reduce_join(no_whitespace_list, separator="", axis=-1)
-    x_start = tf.broadcast_to("#"*(NGRAM-1), (tf.shape(x)[0],) )  # Essentially start token
+    x_start = tf.broadcast_to("#"*NGRAM, (tf.shape(x)[0],) )  # Essentially start token
     x = tf.strings.reduce_join([x_start, x], axis=0)
 
     y = y + 1 # Add 1 to tell difference between labels and missing
@@ -184,9 +184,9 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
         logger.info("Running a negative control experiment")
         present = labels != 0
         labels = tf.random.stateless_binomial(shape=tf.shape(labels), seed=[1507, 1997], counts=1, probs=0.5) + 1
-        labels = tf.cast(labels, tf.int64)
+        labels = tf.cast(labels, y.dtype)
         labels = tf.cast(present, labels.dtype)*labels
-    return (x, y[:,:-1]), labels
+    return (x, y), labels
 
 if RUN_AS_SCRIPT:
     train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
@@ -265,13 +265,19 @@ if RUN_AS_SCRIPT:
         inputs = train_ds.map(get_without_spaces)
         # outputs = train_ds.map(get_with_spaces)
         encoder_tokenizer.adapt(inputs)
+        logger.debug("Tokenizer config", encoder_tokenizer.get_config())
+        with open("tokenizer_config", "w") as f:
+            json.dump(encoder_tokenizer.get_config(), f)
         # decoder_tokenizer.adapt(outputs)
 
 # # Metrics and losses
 # with strategy.scope():
-loss_object = tf.keras.losses.BinaryCrossentropy(
-    from_logits=False,
-    reduction=tf.keras.losses.Reduction.NONE # Need no reduction so we can mask out irrelevant predictions
+# loss_object = tf.keras.losses.BinaryCrossentropy(
+#     from_logits=False,
+#     reduction=tf.keras.losses.Reduction.NONE # Need no reduction so we can mask out irrelevant predictions
+# )
+loss_object = tf.keras.losses.MeanSquaredError(
+    reduction=tf.keras.losses.Reduction.NONE
 )
 
 def get_real(real_raw):
@@ -316,7 +322,7 @@ def loss_function(real, pred, mask):
         pred = tf.squeeze(pred, axis=-1)
     pred *= tf.cast(mask, dtype=pred.dtype)
     loss_object.reduction = tf.losses.Reduction.NONE # Make loss not reduce so we can sample dist of loss
-    loss_ = loss_object(real, pred)
+    loss_ = loss_object(real, pred) # batch,1
     # Dont divide by tf.cast(tf.reduce_sum(mask), dtype=loss_.dtype) 
     # as we hope that the masked (0 + eps) output matching the real 0 is good enough to not fit to masked data
     return tf.reduce_mean(loss_), loss_
@@ -906,6 +912,8 @@ class Transformer(tf.keras.Model):
           tokenizer=input_tokenizer,
           dropout_rate=dropout_rate
           )
+        
+        tf.print("-"*10, input_tokenizer.get_config())
 
         # The decoder.
         self.decoder = Decoder(
@@ -916,6 +924,7 @@ class Transformer(tf.keras.Model):
           dropout_rate=dropout_rate
           )
 
+        self.tokenizer = input_tokenizer
         # The final linear layer.
         self.dense = tf.keras.layers.Dense(1, activation="sigmoid")        
         self.final_layer = NoTwoSpaces(classification_threshold)
@@ -1038,7 +1047,7 @@ class Transformer(tf.keras.Model):
 
 # # Model creation + training
 # ## Hyperparams and model instantiation
-logger.info("Creating transformer")
+logger.info("Creating Transformer")
 if RUN_AS_SCRIPT:
     transformer = Transformer(
         num_layers=NUM_LAYERS,
@@ -1050,6 +1059,12 @@ if RUN_AS_SCRIPT:
         )
 
 # ## Training details
+class SaveTokenizer(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        self.tokenizer.save_weights(CHECKPOINT_DIR+'tokenizer_weights')
+        with open(CHECKPOINT_DIR+'tokenizer_weights', 'w') as f:
+            json.dump(self.tokenizer.get_config(), f)
+
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, d_model, warmup_steps=200):
         super().__init__()
