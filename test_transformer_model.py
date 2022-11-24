@@ -32,7 +32,7 @@ set_global_determinism(150797)
 
 class TestInputPipeline(tf.test.TestCase):
     def test_mapping(self):
-        prepend = "#"*(NGRAM-1)
+        prepend = "#"*(NGRAM)
         mappings = [
         (
             tf.constant([
@@ -43,19 +43,19 @@ class TestInputPipeline(tf.test.TestCase):
             (
                 (
                     tf.constant([
-                        'thecatsatonthemat',
-                        'whatifawordisnotlong'
+                        prepend+'thecatsatonthemat',
+                        prepend+'whatifawordisnotlong'
                     ]),
-                    tf.constant([
-                        prepend+'the cat sat on the mat ',
-                        prepend+'what if a word is not long '
-                    ]),
+                    tf.ragged.constant([
+                        [2, 1, 1, 2, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 2],
+                        [2, 1, 1, 1, 2, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 1, 2]
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS]),
                 )
                 ,
                 tf.ragged.constant([
-                    [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2],
-                    [1, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 2]
-                ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1])             
+                    [1, 1, 2, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 2],
+                    [1, 1, 1, 2, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 1, 2]
+                ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1])             
             )
         ),
         ]
@@ -69,7 +69,7 @@ class TestInputPipeline(tf.test.TestCase):
                 self.assertAllEqual(expected_output[0][1], res[0][1])
 
     def test_negative_control(self):
-        prepend = "#"*(NGRAM-1)
+        prepend = "#"*(NGRAM)
         mappings = [
         (
             tf.constant([
@@ -80,19 +80,19 @@ class TestInputPipeline(tf.test.TestCase):
             (
                 (
                     tf.constant([
-                        'thecatsatonthemat',
-                        'whatifawordisnotlong'
+                        prepend+'thecatsatonthemat',
+                        prepend+'whatifawordisnotlong'
                     ]),
-                    tf.constant([
-                        prepend+'the cat sat on the mat ',
-                        prepend+'what if a word is not long '
-                    ]),
+                    tf.ragged.constant([
+                        [2, 1, 1, 2, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 2],
+                        [2, 1, 1, 1, 2, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 1, 2]
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS]),
                 )
                 ,
                 tf.ragged.constant([
-                    [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2],
-                    [1, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 2]
-                ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1])             
+                    [1, 1, 2, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 2],
+                    [1, 1, 1, 2, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 1, 2]
+                ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1])             
             )
         ),
         ]
@@ -102,7 +102,7 @@ class TestInputPipeline(tf.test.TestCase):
             spaces = tf.cast((res[1] - 1), mask.dtype)*mask
             av_spaces = tf.reduce_mean(tf.reduce_sum(spaces, axis=-1)/tf.reduce_sum(mask, axis=-1))
             with self.subTest("Labels correct"):
-                self.assertBetween(av_spaces, 0.4, 0.6) # TODO: figure out a proper 99% CI
+                self.assertBetween(av_spaces, 0.35, 0.65) # TODO: figure out a proper 99% CI
             with self.subTest("Encoder input correct"):
                 self.assertAllEqual(expected_output[0][0], res[0][0])
             with self.subTest("Decoder input correct"):
@@ -153,6 +153,20 @@ class TestMetrics(tf.test.TestCase):
                 ,
                 tf.constant(0.0)
             ),
+            ( # Testing if masking is working as expected
+                (
+                    tf.ragged.constant([
+                        [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2],
+                        [1, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 2]
+                    ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                    tf.ragged.constant([
+                        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 3, 3, 3],
+                        [0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3, 3, 3]
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                )
+                ,
+                tf.constant(1.0)
+            ),
         ]
 
         for _input, expected_output in mappings:
@@ -170,7 +184,7 @@ class TestMetrics(tf.test.TestCase):
                     ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
                     tf.ragged.constant([
                         [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
-                        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                        [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
                     ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
                 )
                 ,
@@ -222,15 +236,15 @@ class TestMetrics(tf.test.TestCase):
                         [1, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 2]
                     ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
                     tf.ragged.constant([
-                        [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1],
-                        [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+                        [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]
                     ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
                 )
                 ,
                 (
                     # Both cases have multiple predicted value that is not a true positive
                     tf.constant([
-                        1/4,
+                        1/2,
                         1/3
                     ]),
                     tf.constant([
@@ -255,15 +269,41 @@ class TestMetrics(tf.test.TestCase):
                 (
                     # Both cases have multiple predicted value that is not a true positive
                     tf.constant([
-                        1/4,
+                        2/4,
                         1/3
                     ]),
                     tf.constant([
-                        1/6,
+                        2/6,
                         1/7
                     ]),
                 ),
                 "Both poor - preds starting with space"
+            ),
+            (
+                (
+                    tf.ragged.constant([
+                        [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2],
+                        [1, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 2]
+                    ], dtype=tf.int64).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                    tf.ragged.constant([
+                        [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 3, 3, 3],
+                        [0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3, 3, 3]
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]) ,
+                )
+                ,
+                (
+                    # All predicted positives are real positives in both cases
+                    tf.constant([
+                        6/6,
+                        7/7,
+                    ]),
+                    # All real values recalled
+                    tf.constant([
+                        6/6,
+                        7/7,
+                    ]),
+                ),
+                "Good overall - with extra noise in preds"
             ),
         ]
 
