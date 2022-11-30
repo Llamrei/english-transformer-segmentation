@@ -60,8 +60,9 @@ if RUN_AS_SCRIPT:
     file_output.setFormatter(formatter)
     logger.addHandler(file_output)
 
-DEBUG = False
+DEBUG = True
 NEGATIVE_CONTROL = False
+POSITIVE_CONTROL = False
 
 logger.info(f"Eager: {tf.executing_eagerly()}")
 
@@ -81,7 +82,7 @@ MAX_CHARS = 500 if not DEBUG else 100
 BATCH_SIZE = 8 if not DEBUG else 2
 
 # Metric params
-CLASS_THRESHOLD = 0.3
+CLASS_THRESHOLD = 0.5
 
 # Model params
 NUM_LAYERS = 6 if not DEBUG else 4
@@ -131,14 +132,20 @@ def unescape(text):
 def join_title_desc(text):
     return text['title'] + ' ' + text['description']
 
-def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
+def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL, positive_control=POSITIVE_CONTROL):
     x = tf.strings.lower(text)
     x = tf.strings.substr(x, 0, MAX_CHARS)
     # We want to sometimes replace punctuation with a space : "bad.sentence" -> "bad. sentence"
     # and other time to replace it with nothing: "don't" -> "dont"
     x = tf.strings.regex_replace(x, JOINING_PUNC, "")
     x = tf.strings.regex_replace(x, SPLITTING_PUNC, r"\1 ")   # \1 inserts captured splitting punctuation, raw so python doesnt magic it
+    if positive_control:
+        x = tf.strings.regex_replace(x, r"\s", "")
+        logging.info("Running a positive control experiment")
+        x = tf.strings.regex_replace(x, r"(a)", r"\1 ")
+    
     x = tf.strings.split(x)
+
     no_whitespace_list = tf.strings.strip(x) # Remove any excess whitespace, e.g. tabs, double spaces etc.
     word_lengths = tf.strings.length(no_whitespace_list)
     def mark_spaces(row_of_word_lengths):
@@ -186,7 +193,7 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL):
         labels = tf.random.stateless_binomial(shape=tf.shape(labels), seed=[1507, 1997], counts=1, probs=0.5) + 1
         labels = tf.cast(labels, y.dtype)
         labels = tf.cast(present, labels.dtype)*labels
-    return (x, y), labels
+    return (x, y[:,:-1]), labels # We don't need to try to predict last token as we know there is a space
 
 if RUN_AS_SCRIPT:
     train_ds = train.shuffle(100).batch(BATCH_SIZE).map(join_title_desc).map(unescape).map(strip_spaces_and_set_predictions)
@@ -260,19 +267,23 @@ if RUN_AS_SCRIPT:
         inputs = train_ds.take(200).map(get_without_spaces)
         # outputs = train_ds.take(200).map(get_with_spaces)
         encoder_tokenizer.adapt(inputs)
+        print(f"Length of vocab: {len(encoder_tokenizer.get_vocabulary())}")
         # decoder_tokenizer.adapt(outputs)
     else:
         inputs = train_ds.map(get_without_spaces)
         # outputs = train_ds.map(get_with_spaces)
         encoder_tokenizer.adapt(inputs)
         logger.debug("Tokenizer config", encoder_tokenizer.get_config())
-        encoder_tokenizer.save_weights('tokenizer_weights')
+        tf.keras.Sequential([encoder_tokenizer]).save('tokenizer_layer_model', save_format='tf')
         with open("tokenizer_config", "w") as f:
             json.dump(encoder_tokenizer.get_config(), f)
+        with open("tokenizer_vocab", "w") as f:
+            json.dump(encoder_tokenizer.get_vocabulary(), f)
         # decoder_tokenizer.adapt(outputs)
 
 # # Metrics and losses
 # with strategy.scope():
+# BinaryCrossEntropy is for bernoulli
 # loss_object = tf.keras.losses.BinaryCrossentropy(
 #     from_logits=False,
 #     reduction=tf.keras.losses.Reduction.NONE # Need no reduction so we can mask out irrelevant predictions
@@ -323,8 +334,12 @@ def loss_function(real, pred, mask):
         pred = tf.squeeze(pred, axis=-1)
     pred *= tf.cast(mask, dtype=pred.dtype)
     loss_object.reduction = tf.losses.Reduction.NONE # Make loss not reduce so we can sample dist of loss
-    weights = real/0.2 + (1-real)/0.8
-    loss_ = loss_object(real, pred, sample_weight=weights) # batch,1
+    weights = (real/0.2 + (1-real)/0.8) # space are only 1/5 of the data
+    if DEBUG:
+        tf.print("Sample wieghting", weights, summarize=-1)
+    # loss_ = loss_object(real, pred, sample_weight=weights[...,tf.newaxis]) # batch,1
+    loss_ = loss_object(real, pred)
+
     # Dont divide by tf.cast(tf.reduce_sum(mask), dtype=loss_.dtype) 
     # as we hope that the masked (0 + eps) output matching the real 0 is good enough to not fit to masked data
     return tf.reduce_mean(loss_), loss_
@@ -947,7 +962,6 @@ class Transformer(tf.keras.Model):
             # The final linear layer output.
             final_output = self.dense(dec_output)  # Shape `(batch_size, tar_seq_len, 1)`.
             # no_two_spaces = self.final_layer(final_output)
-
             # Return the final output and the attention weights.
             return final_output
         else:
@@ -980,6 +994,8 @@ class Transformer(tf.keras.Model):
 
         with tf.GradientTape() as tape:
             preds = self(inputs, training = True)
+            if DEBUG:
+                tf.print("Training raw predictions", preds, summarize=-1)
             loss, loss_dist = loss_function(real, preds, real_mask)
         
         gradients = tape.gradient(loss, self.trainable_variables)

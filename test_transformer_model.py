@@ -49,7 +49,7 @@ class TestInputPipeline(tf.test.TestCase):
                     tf.ragged.constant([
                         [2, 1, 1, 2, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 2],
                         [2, 1, 1, 1, 2, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 1, 2]
-                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS]),
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]),
                 )
                 ,
                 tf.ragged.constant([
@@ -61,6 +61,43 @@ class TestInputPipeline(tf.test.TestCase):
         ]
         for _input, expected_output in mappings:
             res = strip_spaces_and_set_predictions(_input, negative_control=False)
+            with self.subTest("Labels correct"):
+                self.assertAllClose(expected_output[1], res[1])
+            with self.subTest("Encoder input correct"):            
+                self.assertAllEqual(expected_output[0][0], res[0][0])
+            with self.subTest("Decoder input correct"):        
+                self.assertAllEqual(expected_output[0][1], res[0][1])
+
+    def test_positive_control(self):
+        prepend = "#"*(NGRAM)
+        mappings = [
+        (
+            tf.constant([
+                'the cat sat on the mata',
+                'what if a word is not longa'
+            ])
+            ,
+            (
+                (
+                    tf.constant([
+                        prepend+'thecatsatonthemata',
+                        prepend+'whatifawordisnotlonga'
+                    ]),
+                    tf.ragged.constant([
+                        [2, 1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 2, 1, 2],
+                        [2, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2]
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]),
+                )
+                ,
+                tf.ragged.constant([
+                    [1, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 2, 1, 2],
+                    [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2]
+                ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1])             
+            )
+        ),
+        ]
+        for _input, expected_output in mappings:
+            res = strip_spaces_and_set_predictions(_input, negative_control=False, positive_control=True)
             with self.subTest("Labels correct"):
                 self.assertAllClose(expected_output[1], res[1])
             with self.subTest("Encoder input correct"):            
@@ -86,7 +123,7 @@ class TestInputPipeline(tf.test.TestCase):
                     tf.ragged.constant([
                         [2, 1, 1, 2, 1, 1, 2, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 2],
                         [2, 1, 1, 1, 2, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 2, 1, 1, 1, 2]
-                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS]),
+                    ], dtype=tf.float32).to_tensor(default_value=0, shape=[None, MAX_CHARS-1]),
                 )
                 ,
                 tf.ragged.constant([
