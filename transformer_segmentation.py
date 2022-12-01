@@ -12,6 +12,7 @@
 # Also: rewrite a token accuracy metric that corresponds to BIES tagging protocol
 # Think why NoTwoSpaces is so slow
 # Think how to make this script less hacky and more testable
+# Start using lovely-tensors for logging
 
 from datetime import datetime
 import logging
@@ -61,7 +62,8 @@ if RUN_AS_SCRIPT:
     logger.addHandler(file_output)
 
 DEBUG = True
-NEGATIVE_CONTROL = False
+VERBOSE = False
+NEGATIVE_CONTROL = True
 POSITIVE_CONTROL = False
 
 logger.info(f"Eager: {tf.executing_eagerly()}")
@@ -89,7 +91,7 @@ NUM_LAYERS = 6 if not DEBUG else 4
 D_MODEL = 512 if not DEBUG else 256
 DFF = 2048 if not DEBUG else 1028
 NUM_ATTENTION_HEADS = 8 if not DEBUG else 2
-DROPOUT_RATE = 0.3 if not DEBUG else 0.1
+DROPOUT_RATE = 0.3 if not DEBUG else 0.1 
 
 # Training params
 EPOCHS = 300 if not DEBUG else 30
@@ -142,7 +144,7 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL, po
     if positive_control:
         x = tf.strings.regex_replace(x, r"\s", "")
         logging.info("Running a positive control experiment")
-        x = tf.strings.regex_replace(x, r"(a)", r"\1 ")
+        x = tf.strings.regex_replace(x, r"(t)", r"\1 ")
     
     x = tf.strings.split(x)
 
@@ -203,7 +205,7 @@ if RUN_AS_SCRIPT:
 
 # TODO: Once we're not always debugging remove this weird condition
 if (DEBUG or True) and RUN_AS_SCRIPT:
-    logger.debug("Generating pipepline label stats")
+    logger.debug("Generating pipeline label stats")
     def label_stats(inputs, labels):
         mask = tf.cast(labels != 0, tf.float32)
         spaces = tf.cast(labels == 2, tf.float32)
@@ -267,7 +269,8 @@ if RUN_AS_SCRIPT:
         inputs = train_ds.take(200).map(get_without_spaces)
         # outputs = train_ds.take(200).map(get_with_spaces)
         encoder_tokenizer.adapt(inputs)
-        print(f"Length of vocab: {len(encoder_tokenizer.get_vocabulary())}")
+        logger.info(f"Length of vocab: {len(encoder_tokenizer.get_vocabulary())}")
+        logger.info(encoder_tokenizer.get_vocabulary())
         # decoder_tokenizer.adapt(outputs)
     else:
         inputs = train_ds.map(get_without_spaces)
@@ -288,12 +291,18 @@ if RUN_AS_SCRIPT:
 #     from_logits=False,
 #     reduction=tf.keras.losses.Reduction.NONE # Need no reduction so we can mask out irrelevant predictions
 # )
-loss_object = tf.keras.losses.MeanSquaredError(
-    reduction=tf.keras.losses.Reduction.NONE
+# loss_object = tf.keras.losses.MeanSquaredError(
+#     reduction=tf.keras.losses.Reduction.NONE
+# )
+loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+    from_logits=False,
+    ignore_class=0
 )
 
 def get_real(real_raw):
     """
+    param real_raw: (Batch, Seq) in {0,1,2}
+
     Converts a batch of {0,1,2} into a batch of {0,1} by mapping 1 to 0 and 2 to 1.
 
     Also returns a batched boolean mask corresponding to locations of original 1s and 2s.
@@ -303,6 +312,7 @@ def get_real(real_raw):
     # Mask will have bool dtype
     mask = tf.math.logical_not(tf.math.equal(real_raw, 0))
     real = real_raw - tf.cast(mask, real_raw.dtype)
+    # real = real_raw
     return real, mask
 
 def used_all_characters_mask(real_raw, pred):
@@ -326,18 +336,23 @@ def used_all_characters_mask(real_raw, pred):
 
 def loss_function(real, pred, mask):
     """
-    Takes a batch of {0,1} labels (e.g. need to preprocess labels before passing), [0,1] predictions and a boolean mask for computing loss.
-    1 indicates space
+    param real: is a (batch, seq) tensor in {0,1,2} - corresponds to labels (0 not in sentence, 1 char, 2 space)
+    param pred: is a (batch, seq, 3) tensor of prediction classes - assumed to be a prob dist (3-simplex)
+    param mask: is a (batch, seq) boolean mask for ignoring predictions outside the sentence.
+
     Also returns a distribution of the loss across the batch.
     """
-    if tf.shape(pred)[-1] == 1:
-        pred = tf.squeeze(pred, axis=-1)
-    pred *= tf.cast(mask, dtype=pred.dtype)
+    pred *= tf.cast(mask[...,tf.newaxis], dtype=pred.dtype)
     loss_object.reduction = tf.losses.Reduction.NONE # Make loss not reduce so we can sample dist of loss
-    weights = (real/0.2 + (1-real)/0.8) # space are only 1/5 of the data
-    if DEBUG:
-        tf.print("Sample wieghting", weights, summarize=-1)
+    # weights = (real/0.2 + (1-real)/0.8) # space are only 1/5 of the data
+    # if DEBUG and VERBOSE:
+    #     tf.print("Sample weighting", weights, summarize=-1)
     # loss_ = loss_object(real, pred, sample_weight=weights[...,tf.newaxis]) # batch,1
+    if DEBUG and VERBOSE:
+        tf.print("In loss\n",
+        "Pred\n", pred,
+        "Real\n", real,
+        summarize=-1)
     loss_ = loss_object(real, pred)
 
     # Dont divide by tf.cast(tf.reduce_sum(mask), dtype=loss_.dtype) 
@@ -346,18 +361,18 @@ def loss_function(real, pred, mask):
 
 def token_accuracy(real_raw, pred):
     """
-    Takes a batch of labels {0,1,2} and batch of predictions [0,1] and returns per token accuracy.
+    param real_raw: is a (batch, seq) tensor in {0,1,2} - corresponds to labels (0 not in sentence, 1 char, 2 space)
+    param pred: is a (batch, seq, 3) tensor of prediction classes - assumed to be a prob dist (3-simplex)
 
-    We can mask out either following only tokens that are in label or tokens in prediction
-    that represent usage of all of the letters. We choose whichever is longer.
+    Takes a batch of labels and batch of predictions and returns per token accuracy.
+
+    We mask any predictions for tokens outside the sentence.
     """
     real, real_mask = get_real(real_raw)
-    real = tf.cast(real, tf.int16)
+    real = tf.cast(real, tf.int16) # Cast to int for complete accuracy
     mask = tf.cast(real_mask, tf.int16)
-    if tf.shape(pred)[-1] == 1:
-        pred = tf.squeeze(pred, axis=-1)
-    pred *= tf.cast(mask, pred.dtype)
-    accuracies = tf.equal(real, tf.cast( pred > CLASS_THRESHOLD, tf.int16))
+    pred *= tf.cast(mask[...,tf.newaxis], pred.dtype)
+    accuracies = tf.equal(real, tf.argmax(pred, axis=-1, output_type=tf.int16)-1)
     accuracies = tf.cast(accuracies, dtype=mask.dtype)
     accuracies *= mask
     return tf.reduce_mean(tf.reduce_sum(accuracies, axis=-1)/tf.reduce_sum(mask, axis=-1))
@@ -369,25 +384,29 @@ def sparse_remove(sparse_tensor, remove_value=0.):
   return tf.sparse.retain(sparse_tensor, tf.not_equal(sparse_tensor.values, remove_value))
 
 def precision_and_recall(real_raw, pred): 
-    # TODO: rewrite this to be correct and masked
     """
-    Given where we guessed spaces to be (batch of predictions in [0,1]) - what fraction are actually spaces
+    param real_raw: is a (batch, seq) tensor in {0,1,2} - corresponds to labels (0 not in sentence, 1 char, 2 space)
+    param pred: is a (batch, seq, 3) tensor of prediction classes - assumed to be a prob dist (3-simplex)
+
+    Given where we guessed spaces to be - what fraction are actually spaces and what fraction of real spaces did we hit
     in the original label (batch of truths {0,1,2} - 0 being padding, 1 being character, 2 being space)
+    
 
     returns TensorShape(batch,precision), TensorShape(batch,recall) tuple
     """
     real, real_mask = get_real(real_raw)
-    if tf.shape(pred)[-1] == 1:
-        pred = tf.squeeze(pred, axis=-1)
     real = tf.cast(real, tf.int16) # batch, seq_len
-    spaces = tf.cast(pred > CLASS_THRESHOLD, tf.int16) # batch, seq_len
-    correct_pos = tf.reduce_sum(tf.cast((tf.equal(real, spaces) & tf.equal(real, 1)) , tf.float32), axis=-1)
+    spaces = tf.argmax(pred, axis=-1, output_type=tf.int16) # batch, seq_len
+    spaces = tf.where(spaces > 0, spaces - 1, spaces)
+    correct_pos = tf.reduce_sum(
+        tf.cast((tf.equal(real, spaces) & tf.equal(real, 1)) , tf.float32)
+        , axis=-1)
 
     real_mask = tf.cast(real_mask, spaces.dtype)
     pred_pos = tf.cast(tf.reduce_sum(spaces*real_mask, axis=-1), tf.float32)
     true_pos = tf.cast(tf.reduce_sum(real, axis=-1), tf.float32)
     
-    if DEBUG:
+    if DEBUG and VERBOSE:
         tf.print(
         "Inside precision/recall function", 
         "\n Label\n", real_raw,
@@ -412,11 +431,12 @@ def sentence_accuracy(labels, pred):
     on the real mask.
     """
     real, real_mask = get_real(labels)
-    mask = tf.cast(real_mask, real.dtype)
-    if tf.shape(pred)[-1] == 1:
-        pred = tf.squeeze(pred, axis=-1)
-    accuracies = tf.equal(real, tf.cast(pred > CLASS_THRESHOLD, real.dtype))
-    accuracies = tf.cast(accuracies, dtype=mask.dtype)
+    mask = tf.cast(real_mask, tf.int16)
+    real = tf.cast(real, tf.int16)
+    accuracies = tf.cast(
+        tf.equal(real, tf.argmax(pred, axis=-1, output_type=real.dtype)-1),
+        tf.int16
+    )
     accuracies *= mask
     accuracies += 1 - mask
     sentence_accuracies = tf.reduce_prod(accuracies, axis=-1)
@@ -601,10 +621,10 @@ def positional_encoding(length, depth):
     return tf.cast(pos_encoding, dtype=tf.float32)
 
 class PositionalEmbedding(tf.keras.layers.Layer):
-    def __init__(self, vocab_size, d_model):
+    def __init__(self, vocab_size, d_model, mask_zero=True):
         super().__init__()
         self.d_model = d_model
-        self.embedding = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=True) 
+        self.embedding = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=mask_zero) 
         self.pos_encoding = positional_encoding(length=MAX_CHARS, depth=d_model)
 
     def compute_mask(self, *args, **kwargs):
@@ -943,7 +963,7 @@ class Transformer(tf.keras.Model):
 
         self.tokenizer = input_tokenizer
         # The final linear layer.
-        self.dense = tf.keras.layers.Dense(1, activation="sigmoid")        
+        self.dense = tf.keras.layers.Dense(3, activation="softmax")  
         self.final_layer = NoTwoSpaces(classification_threshold)
 
     def call(self, inputs, training=False):
@@ -971,32 +991,36 @@ class Transformer(tf.keras.Model):
             # Start simple by doing each element in the batch individually
             logger.debug("Running inference")
             batch_size = tf.shape(to_enc)[0]
-            start = tf.broadcast_to(1., (batch_size,))
+            start = tf.broadcast_to([[0., 0., 1.],], (batch_size,3))
             output_array = tf.TensorArray(dtype=tf.float32, size=MAX_CHARS-1, dynamic_size=False)
             output_array = output_array.write(0, start)
             for char_inx in tf.range(1,MAX_CHARS-1):
-                to_dec = tf.transpose(output_array.stack())
-                # tf.autograph.experimental.set_loop_options(
-                #     shape_invariants=[(to_dec, tf.TensorShape([None, None]))]
-                # )
+                preds = output_array.stack() # (tar_seq_len, batch, 3)
+                preds = tf.transpose(preds, perm = [1,0,2]) # (batch, tar_seq_len, 3)
+                to_dec = tf.cast(
+                    tf.argmax(preds, axis=-1), # (batch, tar_seq_len)
+                    tf.float32
+                )
                 dec_output = self.decoder(
                     to_dec, enc_output, enc_mask, training=False
                 ) # (batch, tar_seq_len, d_model)
-                final_output = self.dense(dec_output) # (batch, tar_seq_len, 1)
-                new_token = tf.squeeze(final_output)[:,char_inx] # (batch, )
-                output_array = output_array.write(char_inx, new_token)
-            return tf.transpose(output_array.stack())[..., tf.newaxis]
+                final_output = self.dense(dec_output) # (batch, tar_seq_len, 3)
+                output_array = output_array.write(char_inx, final_output[:,char_inx,:])
+            preds = output_array.stack() # (tar_seq_len, batch, 3)
+            preds = tf.transpose(preds, perm = [1,0,2]) # (batch, tar_seq_len, 3)
+            return preds
                 
     @tf.function(input_signature=train_step_signature)
     def train_step(self, data):
         inputs, labels = data
         real, real_mask = get_real(labels)
-
+        
         with tf.GradientTape() as tape:
             preds = self(inputs, training = True)
-            if DEBUG:
+            if DEBUG and VERBOSE:
+                tf.print("Training inputs", inputs, summarize=-1)
                 tf.print("Training raw predictions", preds, summarize=-1)
-            loss, loss_dist = loss_function(real, preds, real_mask)
+            loss, loss_dist = loss_function(real+tf.cast(real_mask, real.dtype), preds, real_mask)
         
         gradients = tape.gradient(loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
@@ -1029,7 +1053,10 @@ class Transformer(tf.keras.Model):
         real, real_mask = get_real(labels)
 
         preds = self(inputs, training = False)
-        loss, loss_dist = loss_function(real, preds, real_mask)
+        if DEBUG and VERBOSE:
+            tf.print("\nIn test step\n",
+            preds, summarize=-1)
+        loss, loss_dist = loss_function(real + tf.cast(real_mask, real.dtype), preds, real_mask)
         
         lq, med, uq = tfp.stats.percentile(loss_dist, 10), tfp.stats.percentile(loss_dist, 50), tfp.stats.percentile(loss_dist, 90)
         train_loss_low(med-lq)
@@ -1042,9 +1069,6 @@ class Transformer(tf.keras.Model):
         # train_Voting_Experts(labels, preds) TODO: Fix this metric - is now complaining about graph access :cry:
         metrics = {
             'loss': train_loss.result(),
-            # 'median loss': train_loss_med.result(),
-            # 'bottom decile delta': train_loss_low.result(),
-            # 'top decile delta': train_loss_high.result(),
             'token accuracy': train_token_accuracy.result(),
             'sentence accuracy': train_sentence_accuracy.result(),
             **train_prf.result(),
