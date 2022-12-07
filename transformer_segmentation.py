@@ -61,9 +61,9 @@ if RUN_AS_SCRIPT:
     file_output.setFormatter(formatter)
     logger.addHandler(file_output)
 
-DEBUG = True
+DEBUG = False
 VERBOSE = False
-NEGATIVE_CONTROL = True
+NEGATIVE_CONTROL = False
 POSITIVE_CONTROL = False
 
 logger.info(f"Eager: {tf.executing_eagerly()}")
@@ -80,7 +80,7 @@ else:
 JOINING_PUNC = r"([-'`])"
 SPLITTING_PUNC = r'([!"#$%&()\*\+,\./:;<=>?@\[\\\]^_{|}~])'
 NGRAM = 3 if not DEBUG else 1
-MAX_CHARS = 500 if not DEBUG else 100
+MAX_CHARS = 500 if not DEBUG else 50
 BATCH_SIZE = 8 if not DEBUG else 2
 
 # Metric params
@@ -94,10 +94,12 @@ NUM_ATTENTION_HEADS = 8 if not DEBUG else 2
 DROPOUT_RATE = 0.3 if not DEBUG else 0.1 
 
 # Training params
-EPOCHS = 300 if not DEBUG else 30
+EPOCHS = 300 if not DEBUG else 300
 STEPS_PER_EPOCH = 100 if not DEBUG else 2
 VALIDATION_STEPS = 5 if not DEBUG else 2
 
+if DEBUG:
+    tf.debugging.experimental.enable_dump_debug_info(TENSORBOARD_DIR, tensor_debug_mode="FULL_HEALTH", circular_buffer_size=-1)
 
 visible_devices = tf.config.get_visible_devices('GPU')
 logger.info(f"Num GPUs visible:{len(visible_devices)}")
@@ -351,7 +353,7 @@ def loss_function(real, pred, mask):
     if DEBUG and VERBOSE:
         tf.print("In loss\n",
         "Pred\n", pred,
-        "Real\n", real,
+        "Real\n", real, 
         summarize=-1)
     loss_ = loss_object(real, pred)
 
@@ -847,9 +849,9 @@ class DecoderLayer(tf.keras.layers.Layer):
 
         # Multi-head cross-attention output (`tf.keras.layers.MultiHeadAttention `).
         attn_cross, attn_weights_cross = self.mha_cross(
-            query=out1,
+            query=enc_output,
             value=enc_output,
-            key=enc_output,
+            key=out1,
             attention_mask=attention_mask,  # A boolean mask that prevents attention to certain positions.
             return_attention_scores=True,  # Shape `(batch_size, target_seq_len, d_model)`.
             training=training  # A boolean indicating whether the layer should behave in training mode.
@@ -1053,10 +1055,15 @@ class Transformer(tf.keras.Model):
         real, real_mask = get_real(labels)
 
         preds = self(inputs, training = False)
-        if DEBUG and VERBOSE:
-            tf.print("\nIn test step\n",
-            preds, summarize=-1)
-        loss, loss_dist = loss_function(real + tf.cast(real_mask, real.dtype), preds, real_mask)
+        if DEBUG:
+            tf.print("\nIn test step",
+           "\nLabels:", labels, 
+           "\nReal:  ", real,
+           "\nPred:  ", tf.argmax(preds, axis=-1),
+           "\nRaw:  ", preds,
+           
+           summarize=-1)
+        loss, loss_dist = loss_function(labels, preds, real_mask)
         
         lq, med, uq = tfp.stats.percentile(loss_dist, 10), tfp.stats.percentile(loss_dist, 50), tfp.stats.percentile(loss_dist, 90)
         train_loss_low(med-lq)
