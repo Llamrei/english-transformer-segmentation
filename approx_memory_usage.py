@@ -46,5 +46,6 @@ f"Encoder layer: {encoder_layer*precision/gigabyte_conversion:.2f}GB ({encoder_l
 f"Decoder layer: {decoder_layer*precision/gigabyte_conversion:.2f}GB ({decoder_layer/total_mem:.2f})\n"
 f"Encoder overall: {encoder*precision/gigabyte_conversion:.2f}GB ({encoder/total_mem:.2f})\n"
 f"Decoder overall: {decoder*precision/gigabyte_conversion:.2f}GB ({decoder/total_mem:.2f})\n"
-f"Overall : {total_mem*precision/gigabyte_conversion:.2f}GB\n"
+f"Overall: {total_mem*precision/gigabyte_conversion:.2f}GB\n"
+f"Params approx: {total_mem:,}"
 )

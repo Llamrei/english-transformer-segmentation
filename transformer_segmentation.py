@@ -14,6 +14,12 @@
 # Think how to make this script less hacky and more testable
 # Start using lovely-tensors for logging
 
+# Double check loss is definied in right direction
+# Check labeling
+# - Especially alignment
+# Make sure I'm not putting in 1s and 2s: after switching to avoid masking
+# Focus on positive/negative control encoder only
+
 from datetime import datetime
 import logging
 import logging.handlers as handlers
@@ -61,7 +67,7 @@ if RUN_AS_SCRIPT:
     file_output.setFormatter(formatter)
     logger.addHandler(file_output)
 
-DEBUG = False
+DEBUG = True
 VERBOSE = False
 NEGATIVE_CONTROL = False
 POSITIVE_CONTROL = False
@@ -145,8 +151,8 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL, po
     x = tf.strings.regex_replace(x, SPLITTING_PUNC, r"\1 ")   # \1 inserts captured splitting punctuation, raw so python doesnt magic it
     if positive_control:
         x = tf.strings.regex_replace(x, r"\s", "")
-        logging.info("Running a positive control experiment")
-        x = tf.strings.regex_replace(x, r"(t)", r"\1 ")
+        logger.info("Running a positive control experiment")
+        x = tf.strings.regex_replace(x, r"(e)", r"\1 ")
     
     x = tf.strings.split(x)
 
@@ -297,8 +303,9 @@ if RUN_AS_SCRIPT:
 #     reduction=tf.keras.losses.Reduction.NONE
 # )
 loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
-    from_logits=False,
-    ignore_class=0
+    from_logits=True,
+    ignore_class=0,
+    reduction=tf.keras.losses.Reduction.NONE
 )
 
 def get_real(real_raw):
@@ -955,18 +962,17 @@ class Transformer(tf.keras.Model):
         tf.print("-"*10, input_tokenizer.get_config())
 
         # The decoder.
-        self.decoder = Decoder(
-          num_layers=num_layers,
-          d_model=d_model,
-          num_attention_heads=num_attention_heads,
-          dff=dff,
-          dropout_rate=dropout_rate
-          )
+        # self.decoder = Decoder(
+        #   num_layers=num_layers,
+        #   d_model=d_model,
+        #   num_attention_heads=num_attention_heads,
+        #   dff=dff,
+        #   dropout_rate=dropout_rate
+        #   )
 
         self.tokenizer = input_tokenizer
         # The final linear layer.
-        self.dense = tf.keras.layers.Dense(3, activation="softmax")  
-        self.final_layer = NoTwoSpaces(classification_threshold)
+        self.dense = tf.keras.layers.Dense(3)  
 
     def call(self, inputs, training=False):
         # Keras models prefer if you pass all your inputs in the first argument.
@@ -976,15 +982,12 @@ class Transformer(tf.keras.Model):
         enc_output = self.encoder(to_enc, training)  # `(batch_size, inp_seq_len, d_model)`
         enc_mask = self.encoder.compute_mask(to_enc)
 
-        if training:
+        if True:
             # The decoder output.
-            dec_output = self.decoder(
-                to_dec, enc_output, enc_mask, training)  # `(batch_size, tar_seq_len, d_model)`
+            # dec_output = self.decoder(
+            #     to_dec, enc_output, enc_mask, training)  # `(batch_size, tar_seq_len, d_model)`
 
-            # The final linear layer output.
-            final_output = self.dense(dec_output)  # Shape `(batch_size, tar_seq_len, 1)`.
-            # no_two_spaces = self.final_layer(final_output)
-            # Return the final output and the attention weights.
+            final_output = self.dense(enc_output)  # Shape `(batch_size, tar_seq_len, 1)`.
             return final_output
         else:
             # Essentially while we still have characters to place spaces 
