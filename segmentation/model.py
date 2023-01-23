@@ -26,7 +26,7 @@ def positional_encoding(length, per_trig_d_model):
 
     return tf.cast(pos_encoding, dtype=tf.float32)
 
-class Embedding(tf.keras.layers.Layer):
+class PostionalEmbedding(tf.keras.layers.Layer):
     def __init__(self, vocab_size, d_model, max_seq_len, mask_zero=True):
         """
         Generate a layer to embed input tokens that are already int-encoded
@@ -37,11 +37,12 @@ class Embedding(tf.keras.layers.Layer):
         self.d_model = d_model
         self.embedding = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=mask_zero) 
         self.pos_encoding = positional_encoding(length=max_seq_len, per_trig_d_model=d_model)
+        self.supports_masking = True
 
     def compute_mask(self, *args, **kwargs):
         return self.embedding.compute_mask(*args, **kwargs)
 
-    def call(self, x):
+    def call(self, x, mask=None):
         # Assumes (batch, seq_len) string inputs
         seq_len = tf.shape(x)[1]
         x = self.embedding(x)
@@ -140,7 +141,7 @@ class Encoder(tf.keras.layers.Layer):
         self.tokenizer = tokenizer
 
         # Embeddings + Positional encoding
-        self.pos_embedding = Embedding(tokenizer.vocabulary_size(), d_model, seq_len)
+        self.pos_embedding = PostionalEmbedding(tokenizer.vocabulary_size(), d_model, seq_len)
 
         # Encoder layers.
         self.enc_layers = [
@@ -163,7 +164,7 @@ class Encoder(tf.keras.layers.Layer):
         # Sum up embeddings and positional encoding.
         x = self.tokenizer(x)
         mask = self.pos_embedding.compute_mask(x)
-        x = self.pos_embedding(x)  # Shape `(batch_size, input_seq_len, d_model)`.
+        x = self.pos_embedding(x, mask=mask)  # Shape `(batch_size, input_seq_len, d_model)`.
         # Add dropout.
         x = self.dropout(x, training=training)
 
@@ -277,7 +278,7 @@ class Decoder(tf.keras.layers.Layer):
         self.d_model = d_model
         self.num_layers = num_layers
 
-        self.pos_embedding = Embedding(len(Decoder.output_tokens), d_model, seq_len)
+        self.pos_embedding = PostionalEmbedding(len(Decoder.output_tokens), d_model, seq_len)
 
         self.dec_layers = [
             DecoderLayer(
@@ -290,6 +291,10 @@ class Decoder(tf.keras.layers.Layer):
         ]
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
     
+    def compute_mask(self, x, previous_mask=None):
+        x = self.tokenizer(x)
+        return self.pos_embedding.compute_mask(x, previous_mask)
+
     def call(self, dec_input, enc_output, enc_mask, training):
         mask = self.pos_embedding.compute_mask(dec_input)
         x = self.pos_embedding(dec_input)  # Shape: `(batch_size, target_seq_len, d_model)`.
