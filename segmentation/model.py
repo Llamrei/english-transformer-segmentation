@@ -338,7 +338,7 @@ class SpaceSegmentationTransformer(tf.keras.Model):
           )
 
         self.tokenizer = input_tokenizer
-        self.dense = tf.keras.layers.Dense(len(Decoder.output_tokens))  
+        self.dense = tf.keras.layers.Dense(len(Decoder.output_tokens), activation="softmax")  
 
     def call(self, inputs, training=False):
         """
