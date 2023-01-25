@@ -150,9 +150,9 @@ def strip_spaces_and_set_predictions(text, negative_control=NEGATIVE_CONTROL, po
     x = tf.strings.regex_replace(x, JOINING_PUNC, "")
     x = tf.strings.regex_replace(x, SPLITTING_PUNC, r"\1 ")   # \1 inserts captured splitting punctuation, raw so python doesnt magic it
     if positive_control:
-        x = tf.strings.regex_replace(x, r"\s", "")
+        x = tf.strings.regex_replace(x, r"\s", "") # remove all whitespace
         logger.info("Running a positive control experiment")
-        x = tf.strings.regex_replace(x, r"(e)", r"\1 ")
+        x = tf.strings.regex_replace(x, r"(e)", r"\1 ") # add whitespace back in after every letter e
     
     x = tf.strings.split(x)
 
