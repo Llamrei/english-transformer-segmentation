@@ -4,7 +4,7 @@ import numpy as np
 # TODO: Add logging
 
 # # Embedding defn
-def positional_encoding(length, per_trig_d_model):
+def positional_encoding(length, depth):
     """
     Generates a matrix following:
     $$
@@ -13,7 +13,7 @@ def positional_encoding(length, per_trig_d_model):
     where d is the dimensionality of the output embedding and the position
     is defined absolutely (from 0).
     """
-    per_trig_d_model = per_trig_d_model/2
+    per_trig_d_model = depth/2
 
     positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
     depths = np.arange(per_trig_d_model)[np.newaxis, :]/per_trig_d_model   # (1, depth/2)
@@ -36,7 +36,7 @@ class PostionalEmbedding(tf.keras.layers.Layer):
         super().__init__()
         self.d_model = d_model
         self.embedding = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=mask_zero) 
-        self.pos_encoding = positional_encoding(length=max_seq_len, per_trig_d_model=d_model)
+        self.pos_encoding = positional_encoding(length=max_seq_len, depth=d_model)
         self.supports_masking = True
 
     def compute_mask(self, *args, **kwargs):
@@ -44,10 +44,9 @@ class PostionalEmbedding(tf.keras.layers.Layer):
 
     def call(self, x, mask=None):
         # Assumes (batch, seq_len) string inputs
-        seq_len = tf.shape(x)[1]
         x = self.embedding(x)
         x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        x = x + self.pos_encoding[tf.newaxis, :seq_len, :]
+        x = x + self.pos_encoding[tf.newaxis, :, :]
         return x
 
 def point_wise_feed_forward_network(
@@ -338,7 +337,7 @@ class SpaceSegmentationTransformer(tf.keras.Model):
           )
 
         self.tokenizer = input_tokenizer
-        self.dense = tf.keras.layers.Dense(len(Decoder.output_tokens), activation="softmax")  
+        self.dense = tf.keras.layers.Dense(len(Decoder.output_tokens))  # Why does softmax here break it?
 
     def call(self, inputs, training=False):
         """
@@ -352,6 +351,7 @@ class SpaceSegmentationTransformer(tf.keras.Model):
         run_sequential = False
 
         if not training:
+            # This is where we will migrate sequential generation once we re-include the decoder
             batch_size = tf.shape(to_enc)[0]
             to_dec = tf.zeros((batch_size, 1))
             run_sequential = True
