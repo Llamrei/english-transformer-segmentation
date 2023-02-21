@@ -39,11 +39,14 @@ class SparseAccuracyWithIgnore(tf.keras.metrics.SparseCategoricalAccuracy):
         super().__init__(name, dtype)
     
     def update_state(self, y_true, y_pred, sample_weight=None):
-        if self.ignore_token:
-            mask = tf.not_equal(y_true, tf.cast(self.ignore_token, y_true.dtype))
-            y_true = y_true[mask]
-            y_pred = y_pred[mask]
-        return super().update_state(y_true, y_pred, sample_weight)
+        if self.ignore_token is not None:
+            mask = tf.math.not_equal(y_true, tf.cast(self.ignore_token, y_true.dtype))
+            y_true = tf.boolean_mask(y_true, mask)
+            y_pred = tf.boolean_mask(y_pred, mask)
+            # TODO: Confirm the masking semantics do as we expect
+            # bit weird it doesn't return a ragged tensor
+            # Also a bit weird it wasn't a problem before
+        return super().update_state(y_true, y_pred)
 
 class SparseF1(tf.keras.metrics.Metric):
     def __init__(self, name=None, class_id=None, **kwargs):

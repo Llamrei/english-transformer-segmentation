@@ -14,6 +14,7 @@ def positional_encoding(length, depth):
     is defined absolutely (from 0).
     """
     per_trig_d_model = depth/2
+    
 
     positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
     depths = np.arange(per_trig_d_model)[np.newaxis, :]/per_trig_d_model   # (1, depth/2)
@@ -26,7 +27,24 @@ def positional_encoding(length, depth):
 
     return tf.cast(pos_encoding, dtype=tf.float32)
 
+def positional_encoding_alternating(seq_len, d_model):
+    # TODO: Try this alternative encoding
+    max_wavelength = 10000.
+
+    pos = np.arange(seq_len)
+    inx = np.arange(d_model)
+
+    I, P = np.meshgrid(inx, pos)
+    pe_even = np.sin(P / max_wavelength**(I/d_model))
+    pe_odd = np.cos(P / max_wavelength**(I/d_model))
+        
+    pe = np.zeros((seq_len, d_model))
+    pe[:, ::2] = pe_even[:, ::2]
+    pe[:, 1::2] = pe_odd[:, ::2]
+    return tf.constant(pe, dtype=tf.float32)
+
 class PostionalEmbedding(tf.keras.layers.Layer):
+    # TODO: FIX spelling
     def __init__(self, vocab_size, d_model, max_seq_len, mask_zero=True):
         """
         Generate a layer to embed input tokens that are already int-encoded
@@ -43,10 +61,10 @@ class PostionalEmbedding(tf.keras.layers.Layer):
         return self.embedding.compute_mask(*args, **kwargs)
 
     def call(self, x, mask=None):
-        # Assumes (batch, seq_len) string inputs
-        x = self.embedding(x)
-        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        x = x + self.pos_encoding[tf.newaxis, :, :]
+        # Assumes (batch, seq_len) int-encoded inputs
+        x = self.embedding(x) # (batch, seq_len, d_model)
+        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32)) # TODO: try running without this
+        x = x + self.pos_encoding[tf.newaxis, :, :] # new axis for batch dimension - try without
         return x
 
 def point_wise_feed_forward_network(
@@ -74,7 +92,7 @@ class EncoderLayer(tf.keras.layers.Layer):
         self.mha = tf.keras.layers.MultiHeadAttention(
             num_heads=num_attention_heads,
             key_dim=d_model, # Size of each attention head for query Q and key K.
-            dropout=dropout_rate,
+            dropout=dropout_rate, # TODO: maybe dropout?
             )
         # Point-wise feed-forward network.
         self.ffn = point_wise_feed_forward_network(d_model, dff)
@@ -114,7 +132,7 @@ class EncoderLayer(tf.keras.layers.Layer):
 
         # Point-wise feed-forward network output.
         ffn_output = self.ffn(out1)  # Shape `(batch_size, input_seq_len, d_model)`
-        ffn_output = self.dropout1(ffn_output, training=training)
+        ffn_output = self.dropout1(ffn_output, training=training) # TODO: try removing dropout errywhere
         # Point-wise feed-forward network output after layer normalization and a residual skip connection.
         out2 = self.layernorm2(out1 + ffn_output)  # Shape `(batch_size, input_seq_len, d_model)`.
 
@@ -151,10 +169,8 @@ class Encoder(tf.keras.layers.Layer):
               dropout_rate=dropout_rate,
               name=f"encoder_sublayer_{i}")
             for i in range(num_layers)]
-        # Dropout.
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
 
-    # Masking.
     def compute_mask(self, x, previous_mask=None):
         x = self.tokenizer(x)
         return self.pos_embedding.compute_mask(x, previous_mask)
@@ -163,12 +179,17 @@ class Encoder(tf.keras.layers.Layer):
         # Sum up embeddings and positional encoding.
         x = self.tokenizer(x)
         mask = self.pos_embedding.compute_mask(x)
+        # TODO: why am i giving back the mask here?
+        # FIXME: Remove pointless mask passing
         x = self.pos_embedding(x, mask=mask)  # Shape `(batch_size, input_seq_len, d_model)`.
         # Add dropout.
+        # ?
         x = self.dropout(x, training=training)
 
         # N encoder layers.
         for i in range(self.num_layers):
+            # TODO: Do not need to pass mask 
+            # TODO: Check mask propagation
             x = self.enc_layers[i](x, training, mask)
 
         return x  # Shape `(batch_size, input_seq_len, d_model)`.
@@ -323,9 +344,11 @@ class SpaceSegmentationTransformer(tf.keras.Model):
                input_tokenizer,
                seq_len,
                dropout_rate=0.1,
-               classification_threshold=0.5
+               classification_threshold=0.5,
+               num_classes=2,
                ):
         super().__init__()
+        d_model = d_model + 1 if d_model % 2 == 1 else d_model # Ensure even dimensionality so our positional encodings work
         self.encoder = Encoder(
           num_layers=num_layers,
           d_model=d_model,
@@ -333,11 +356,10 @@ class SpaceSegmentationTransformer(tf.keras.Model):
           dff=dff,
           tokenizer=input_tokenizer,
           dropout_rate=dropout_rate,
-          seq_len=seq_len
+          seq_len=seq_len,
           )
-
         self.tokenizer = input_tokenizer
-        self.dense = tf.keras.layers.Dense(len(Decoder.output_tokens))  # Why does softmax here break it?
+        self.dense = tf.keras.layers.Dense(num_classes, activation="softmax")  # Why does softmax here break it?
 
     def call(self, inputs, training=False):
         """
@@ -359,23 +381,8 @@ class SpaceSegmentationTransformer(tf.keras.Model):
         
         # The encoder output.
         enc_output = self.encoder(to_enc, training)  # `(batch_size, inp_seq_len, d_model)`
-        enc_mask = self.encoder.compute_mask(to_enc)
+        # enc_mask = self.encoder.compute_mask(to_enc)
         return self.dense(enc_output)
-    
-    def compile(
-        self, 
-        optimizer="rmsprop", 
-        loss=None, 
-        metrics=None, 
-        loss_weights=None, 
-        weighted_metrics=None, 
-        run_eagerly=None, 
-        steps_per_execution=None, 
-        jit_compile=None, 
-        **kwargs):
-        if not isinstance(loss, LossWithVoids):
-            loss = LossWithVoids(loss, [0])
-        return super().compile(optimizer, loss, metrics, loss_weights, weighted_metrics, run_eagerly, steps_per_execution, jit_compile, **kwargs)
 
 class LossWithVoids(tf.keras.losses.Loss):
     """
@@ -390,8 +397,8 @@ class LossWithVoids(tf.keras.losses.Loss):
     def __call__(self, y_true, y_pred, sample_weight=None):
         mask = tf.cast(tf.ones_like(y_true), tf.bool)
         for token in self.void_tokens:
-            mask &= tf.not_equal(y_true, token)
-        return self.loss.__call__(y_true[mask], y_pred[mask])
+            mask &= tf.not_equal(y_true, token) # (Batch, seq_len)
+        return self.loss.__call__(y_true[mask], y_pred[mask]) 
 
 class WarmupSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, d_model, warmup_steps=200):
