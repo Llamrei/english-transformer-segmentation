@@ -45,7 +45,13 @@ def positional_encoding_alternating(seq_len, d_model):
 
 class PostionalEmbedding(tf.keras.layers.Layer):
     # TODO: FIX spelling
-    def __init__(self, vocab_size, d_model, max_seq_len, mask_zero=True):
+    def __init__(
+            self,
+            vocab_size, 
+            d_model, 
+            max_seq_len,
+            pos_multiplier=1, 
+            mask_zero=True):
         """
         Generate a layer to embed input tokens that are already int-encoded
          through a lookup embedding and positional information 
@@ -56,6 +62,7 @@ class PostionalEmbedding(tf.keras.layers.Layer):
         self.embedding = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=mask_zero) 
         self.pos_encoding = positional_encoding(length=max_seq_len, depth=d_model)
         self.supports_masking = True
+        self.pos_multiplier = pos_multiplier
 
     def compute_mask(self, *args, **kwargs):
         return self.embedding.compute_mask(*args, **kwargs)
@@ -64,7 +71,7 @@ class PostionalEmbedding(tf.keras.layers.Layer):
         # Assumes (batch, seq_len) int-encoded inputs
         x = self.embedding(x) # (batch, seq_len, d_model)
         x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32)) # TODO: try running without this
-        x = x + self.pos_encoding[tf.newaxis, :, :] # new axis for batch dimension - try without
+        x = x + self.pos_multiplier*self.pos_encoding[tf.newaxis, :, :] # new axis for batch dimension - try without
         return x
 
 def point_wise_feed_forward_network(
@@ -147,7 +154,8 @@ class Encoder(tf.keras.layers.Layer):
                dff, # Inner-layer dimensionality.
                tokenizer, # int-mode tokenizer for input text,
                seq_len,
-               dropout_rate=0.1
+               dropout_rate=0.1,
+               pos_multiplier=1
                ):
         super().__init__()
 
@@ -158,7 +166,7 @@ class Encoder(tf.keras.layers.Layer):
         self.tokenizer = tokenizer
 
         # Embeddings + Positional encoding
-        self.pos_embedding = PostionalEmbedding(tokenizer.vocabulary_size(), d_model, seq_len)
+        self.pos_embedding = PostionalEmbedding(tokenizer.vocabulary_size(), d_model, seq_len, pos_multiplier=pos_multiplier)
 
         # Encoder layers.
         self.enc_layers = [
@@ -346,6 +354,7 @@ class SpaceSegmentationTransformer(tf.keras.Model):
                dropout_rate=0.1,
                classification_threshold=0.5,
                num_classes=2,
+               pos_multiplier=1,
                ):
         super().__init__()
         d_model = d_model + 1 if d_model % 2 == 1 else d_model # Ensure even dimensionality so our positional encodings work
@@ -357,6 +366,7 @@ class SpaceSegmentationTransformer(tf.keras.Model):
           tokenizer=input_tokenizer,
           dropout_rate=dropout_rate,
           seq_len=seq_len,
+          pos_multiplier=pos_multiplier
           )
         self.tokenizer = input_tokenizer
         self.dense = tf.keras.layers.Dense(num_classes, activation="softmax")  # Why does softmax here break it?
