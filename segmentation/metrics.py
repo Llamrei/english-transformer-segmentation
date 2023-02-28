@@ -17,21 +17,73 @@ import tensorflow as tf
 # )
 # m.result().numpy()
 
-class SparsePrecision(tf.keras.metrics.Precision):
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        class_dim = tf.shape(y_pred)[-1]
-        return super().update_state(
-            tf.one_hot(tf.cast(y_true, tf.int32), depth=class_dim),
-            tf.one_hot(tf.math.argmax(y_pred, axis=-1), depth=class_dim)
-            )
+def special_divide(a,b,default_val=1.):
+  """
+    Divide such that a/b = 0 if b == 0 and a != 0; `default_val` if a==b==0 and a/b otherwise.
 
-class SparseRecall(tf.keras.metrics.Recall):
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        class_dim = tf.shape(y_pred)[-1]
-        return super().update_state(
-            tf.one_hot(tf.cast(y_true, tf.int32), depth=class_dim),
-            tf.one_hot(tf.math.argmax(y_pred, axis=-1), depth=class_dim)
-            )
+    Allows for usage in precision and recall calcs when there is no positive cases in denom.
+  """
+  ans = tf.math.divide_no_nan(a,b)
+  ans = tf.where(tf.logical_and(b==0, a!=0), 0., ans)
+  ans = tf.where(tf.logical_and(b==0, a==0), default_val, ans)
+  return ans
+
+class SparsePrecision(tf.keras.metrics.Metric):
+  def __init__(self, name="precision", class_id=1, batch_size=64, **kwargs):
+    super().__init__(name=name, **kwargs)
+    self.precision = self.add_weight(name="precision", initializer="zeros", dtype=tf.float32)
+    self.i = self.add_weight(name="i", initializer="zeros")
+    self.class_id = class_id
+
+  def update_state(self, y_true, y_pred, sample_weight=None):
+    """
+      y_true assumed (Batch, Seq)
+      y_pred assumed (Batch, Seq, Classes) where Classes is a distribution on classes
+
+      Assumes fixed and constant batch size
+      Convert distribution of y_pred to prediction via argmax, thus can also handle logits.
+    """
+    preds = tf.argmax(y_pred, axis=-1) # (B, S)
+    class_preds = tf.where(preds==self.class_id, 1., 0.) # (B, S)
+    class_true = tf.where(y_true==self.class_id, 1., 0.) # (B, S)
+    tp = tf.reduce_sum(class_preds*class_true, axis=-1) # (B,)
+    pred_p = tf.reduce_sum(class_preds, axis=-1) # (B,)
+    self.precision.assign(
+        (self.precision*self.i+tf.reduce_mean(special_divide(tp,pred_p)))/(self.i+1)
+    )
+    self.i.assign_add(1)
+
+  def result(self):
+    return self.precision
+
+
+class SparseRecall(tf.keras.metrics.Metric):
+  def __init__(self, name="recall", class_id=1, batch_size=64, **kwargs):
+    super().__init__(name=name, **kwargs)
+    self.recall = self.add_weight(name="recall", initializer="zeros", dtype=tf.float32)
+    self.i = self.add_weight(name="i", initializer="zeros")
+    self.class_id = class_id
+
+  def update_state(self, y_true, y_pred, sample_weight=None):
+    """
+      y_true assumed (Batch, Seq)
+      y_pred assumed (Batch, Seq, Classes) where Classes is a distribution on classes
+
+      Assumes fixed and constant batch size
+      Convert distribution of y_pred to prediction via argmax, thus can also handle logits.
+    """
+    preds = tf.argmax(y_pred, axis=-1) # (B, S)
+    class_preds = tf.where(preds==self.class_id, 1., 0.) # (B, S)
+    class_true = tf.where(y_true==self.class_id, 1., 0.) # (B, S)
+    tp = tf.reduce_sum(class_preds*class_true, axis=-1) # (B,)
+    orig_p = tf.reduce_sum(class_true, axis=-1) # (B,)
+    self.recall.assign(
+        (self.recall*self.i+tf.reduce_mean(special_divide(tp,orig_p)))/(self.i+1)
+    )
+    self.i.assign_add(1)
+
+  def result(self):
+    return self.recall
 
 class SparseAccuracyWithIgnore(tf.keras.metrics.SparseCategoricalAccuracy):
     def __init__(self, name="sparse_categorical_accuracy", dtype=None, ignore_token=None):
@@ -53,7 +105,6 @@ class SparseF1(tf.keras.metrics.Metric):
         super().__init__(name, **kwargs)
         self.precision = SparsePrecision(class_id=class_id)
         self.recall = SparseRecall(class_id=class_id)
-        self.f1 = self.add_weight('f1', initializer="zeros", dtype="float32")
     
     def update_state(self, *args, **kwargs):
         self.precision.update_state(*args, **kwargs)
