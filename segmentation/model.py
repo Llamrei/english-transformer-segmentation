@@ -27,18 +27,18 @@ def positional_encoding(length, depth):
 
     return tf.cast(pos_encoding, dtype=tf.float32)
 
-def positional_encoding_alternating(seq_len, d_model):
+def positional_encoding_alternating(length, depth):
     # TODO: Try this alternative encoding
     max_wavelength = 10000.
 
-    pos = np.arange(seq_len)
-    inx = np.arange(d_model)
+    pos = np.arange(length)
+    inx = np.arange(depth)
 
     I, P = np.meshgrid(inx, pos)
-    pe_even = np.sin(P / max_wavelength**(I/d_model))
-    pe_odd = np.cos(P / max_wavelength**(I/d_model))
+    pe_even = np.sin(P / max_wavelength**(I/depth))
+    pe_odd = np.cos(P / max_wavelength**(I/depth))
         
-    pe = np.zeros((seq_len, d_model))
+    pe = np.zeros((length, depth))
     pe[:, ::2] = pe_even[:, ::2]
     pe[:, 1::2] = pe_odd[:, ::2]
     return tf.constant(pe, dtype=tf.float32)
@@ -60,7 +60,7 @@ class PostionalEmbedding(tf.keras.layers.Layer):
         super().__init__()
         self.d_model = d_model
         self.embedding = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=mask_zero) 
-        self.pos_encoding = positional_encoding(length=max_seq_len, depth=d_model)
+        self.pos_encoding = positional_encoding_alternating(length=max_seq_len, depth=d_model)
         self.supports_masking = True
         self.pos_multiplier = pos_multiplier
 
@@ -155,7 +155,7 @@ class Encoder(tf.keras.layers.Layer):
                tokenizer, # int-mode tokenizer for input text,
                seq_len,
                dropout_rate=0.1,
-               pos_multiplier=1
+               pos_multiplier=1 
                ):
         super().__init__()
 
