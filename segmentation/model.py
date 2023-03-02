@@ -60,7 +60,7 @@ class PostionalEmbedding(tf.keras.layers.Layer):
         super().__init__()
         self.d_model = d_model
         self.embedding = tf.keras.layers.Embedding(vocab_size, d_model, mask_zero=mask_zero) 
-        self.pos_encoding = positional_encoding_alternating(length=max_seq_len, depth=d_model)
+        self.pos_encoding = positional_encoding(length=max_seq_len, depth=d_model)
         self.supports_masking = True
         self.pos_multiplier = pos_multiplier
 
